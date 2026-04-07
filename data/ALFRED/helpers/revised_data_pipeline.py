@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +11,22 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import requests
+
+try:
+    from utils.publication_lags import (
+        PUB_LAG_COLUMNS,
+        default_publication_lag_policy,
+        lagged_observation_date,
+    )
+except ModuleNotFoundError:
+    REPO_ROOT = Path(__file__).resolve().parents[3]
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    from utils.publication_lags import (
+        PUB_LAG_COLUMNS,
+        default_publication_lag_policy,
+        lagged_observation_date,
+    )
 
 API_BASE = "https://api.stlouisfed.org/fred"
 RETRY_STATUS = {429, 500, 502, 503, 504}
@@ -27,12 +44,21 @@ REGISTRY_COLUMNS = [
     "target_series_id",
     "component_series_ids",
     "raw_formula",
+    "pub_lag_mode",
+    "pub_lag_months",
+    "pub_lag_schedule_json",
     "release_rule",
     "revision_class",
     "strict_source_rule",
     "balanced_source_rule",
     "notes",
 ]
+
+# ALFRED vintages already encode real-time availability via realtime_start/end,
+# so the default registry uses same-month as-of selection instead of imposing an
+# extra one-month publication lag on top.
+DEFAULT_RELEASE_RULE = "same_month_end"
+DEFAULT_LAG_MONTHS = 0
 
 SIMPLE_NEVER_REVISED = {"AAA", "BAA", "EXCAUSx", "EXJPUSx", "EXSZUSx", "EXUSUKx", "GS1", "GS10", "GS5"}
 SIMPLE_DIRECT_ALIAS_MAP = {
@@ -148,7 +174,7 @@ def build_simple_registry(series_names: list[str], tcode_map: dict[str, int]) ->
             "target_series_id": s,
             "component_series_ids": [],
             "raw_formula": "",
-            "release_rule": "month_end_plus_1m",
+            "release_rule": DEFAULT_RELEASE_RULE,
             "revision_class": "observable_revisions",
             "notes": "Default direct ALFRED mapping.",
         }
@@ -187,6 +213,7 @@ def build_simple_registry(series_names: list[str], tcode_map: dict[str, int]) ->
     rows = []
     for i, s in enumerate(series_names, start=1):
         r = rules[s]
+        pub_lag = default_publication_lag_policy(s)
         rows.append(
             {
                 "hs_no": i,
@@ -195,16 +222,19 @@ def build_simple_registry(series_names: list[str], tcode_map: dict[str, int]) ->
                 "mnemonic_old": s,
                 "description_hs": s,
                 "tcode_hs": int(tcode_map[s]),
-                "lag_months_hs": 1,
+                "lag_months_hs": DEFAULT_LAG_MONTHS,
                 "vintage_flag_hs": "Y" if r["construction_type"] == "direct_alfred" else "N",
                 "construction_type": _clean(r["construction_type"]),
                 "target_series_id": _clean(r["target_series_id"]),
                 "component_series_ids": json.dumps(r["component_series_ids"], separators=(",", ":"), ensure_ascii=True),
                 "raw_formula": _clean(r["raw_formula"]),
+                "pub_lag_mode": _clean(pub_lag["pub_lag_mode"]),
+                "pub_lag_months": int(pub_lag["pub_lag_months"]),
+                "pub_lag_schedule_json": _clean(pub_lag["pub_lag_schedule_json"]),
                 "release_rule": _clean(r["release_rule"]),
                 "revision_class": _clean(r["revision_class"]),
-                "strict_source_rule": "selected_vintage_or_release_cutoff",
-                "balanced_source_rule": "strict_then_release_gap_then_pre_vintage_then_proxy",
+                "strict_source_rule": "selected_vintage_asof_decision",
+                "balanced_source_rule": "strict_asof_then_release_gap_then_pre_vintage_then_proxy",
                 "notes": _clean(r["notes"]),
             }
         )
@@ -404,6 +434,14 @@ def _history_map(history: pd.DataFrame) -> dict[str, pd.DataFrame]:
 def _pick(hist: pd.DataFrame | None, decision: pd.Timestamp, cutoff_date: pd.Timestamp, mode: str) -> tuple[float, pd.Timestamp | None]:
     if hist is None or hist.empty:
         return np.nan, None
+
+    # Balanced fallback modes may use relaxed vintage selection, but they
+    # should never make a series available before its first published vintage.
+    if mode != "strict_asof" and "realtime_start" in hist.columns:
+        first_available = pd.to_datetime(hist["realtime_start"], errors="coerce").dropna()
+        if not first_available.empty and pd.Timestamp(decision) < first_available.min():
+            return np.nan, None
+
     c = hist[hist["obs_date"] <= cutoff_date]
     if c.empty:
         return np.nan, None
@@ -549,11 +587,21 @@ def _load_vintage(path: Path) -> pd.DataFrame:
     return f
 
 
-def _vintage_file(base: Path, d: pd.Timestamp) -> Path | None:
-    p = base / str(d.year) / f"{d.strftime('%Y-%m')}.csv"
+def _vintage_file(base: Path, decision: pd.Timestamp) -> Path | None:
+    # Historical FRED-MD vintage files are monthly snapshots. We treat a
+    # YYYY-MM vintage as available at that month-end, not at the start of the
+    # month. That gives the intended behavior:
+    # - decision on 2020-01-31 -> use 2020-01 vintage
+    # - decision on 2020-01-01 -> use 2019-12 vintage
+    # - before the first published vintage month -> no vintage available
+    decision = pd.Timestamp(decision)
+    month_end = _month_end(decision)
+    vintage_month = month_end if decision.normalize() == month_end else _month_end(month_end - pd.DateOffset(months=1))
+
+    p = base / str(vintage_month.year) / f"{vintage_month.strftime('%Y-%m')}.csv"
     if p.exists():
         return p
-    p = base / f"{d.strftime('%Y-%m')}.csv"
+    p = base / f"{vintage_month.strftime('%Y-%m')}.csv"
     if p.exists():
         return p
     return None
@@ -562,7 +610,7 @@ def _vintage_file(base: Path, d: pd.Timestamp) -> Path | None:
 def apply_anchor_backfill_to_balanced(
     raw_bal: pd.DataFrame,
     src_bal: pd.DataFrame,
-    series_names: list[str],
+    registry: pd.DataFrame,
     nonrev_raw: pd.DataFrame,
     vintage_dirs: list[Path],
     tag: str = SOURCE_PRE_VINTAGE,
@@ -573,6 +621,14 @@ def apply_anchor_backfill_to_balanced(
     src.index = pd.to_datetime(src.index).map(_month_end)
     nonrev = nonrev_raw.copy()
     nonrev.index = pd.to_datetime(nonrev.index).map(_month_end)
+    reg = registry.copy()
+    if "mnemonic_hs" not in reg.columns:
+        raise RegistryError("registry must include mnemonic_hs for anchor backfill")
+    for col in PUB_LAG_COLUMNS:
+        if col not in reg.columns:
+            reg[col] = reg["mnemonic_hs"].astype(str).map(lambda s: default_publication_lag_policy(s)[col])
+    reg = reg.set_index("mnemonic_hs", drop=False)
+    series_names = reg.index.astype(str).tolist()
 
     cache: dict[Path, pd.DataFrame] = {}
     counts: dict[str, int] = {}
@@ -581,6 +637,8 @@ def apply_anchor_backfill_to_balanced(
         for s in series_names:
             if s not in raw.columns or pd.notna(raw.at[d, s]):
                 continue
+            lag_meta = reg.loc[s]
+            obs_date = lagged_observation_date(d, lag_meta)
 
             filled = False
             for base in vintage_dirs:
@@ -590,9 +648,9 @@ def apply_anchor_backfill_to_balanced(
                 if vp not in cache:
                     cache[vp] = _load_vintage(vp)
                 vm = cache[vp]
-                if vm.empty or s not in vm.columns or d not in vm.index:
+                if vm.empty or s not in vm.columns or obs_date not in vm.index:
                     continue
-                v = vm.at[d, s]
+                v = vm.at[obs_date, s]
                 if pd.notna(v):
                     raw.at[d, s] = float(v)
                     src.at[d, s] = tag
@@ -602,9 +660,9 @@ def apply_anchor_backfill_to_balanced(
 
             if filled or s not in nonrev.columns:
                 continue
-            v = nonrev.at[d, s] if d in nonrev.index else np.nan
+            v = nonrev.at[obs_date, s] if obs_date in nonrev.index else np.nan
             if pd.isna(v):
-                past = nonrev.loc[nonrev.index <= d, s].dropna()
+                past = nonrev.loc[nonrev.index <= obs_date, s].dropna()
                 if not past.empty:
                     v = past.iloc[-1]
             if pd.notna(v):

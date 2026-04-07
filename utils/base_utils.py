@@ -5,8 +5,11 @@ import numpy as np
 import statsmodels.api as sm
 from scipy.stats import t as tstat
 
+from utils.publication_lags import apply_publication_lag_to_panel, load_publication_lag_registry
+
 # Repo root: one level up from utils/
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_DEFAULT_PUB_LAG_REGISTRY = os.path.join(_REPO_ROOT, 'data', 'ALFRED', 'simple_outputs', 'mapping_registry.csv')
 
 
 def load_fred_md_data(filepath: str) -> Tuple[pd.DataFrame, pd.Series]:
@@ -138,6 +141,18 @@ def get_fred_data(filepath: str, start: str, end: str) -> pd.DataFrame:
         filepath = os.path.join(_REPO_ROOT, filepath)
     fred_md = apply_fred_transformations(*load_fred_md_data(filepath))
     return fred_md.loc[start:end]
+
+
+def apply_fred_md_publication_lag(fred_md: pd.DataFrame, registry_path: str | None = None) -> pd.DataFrame:
+    """
+    Apply the shared per-series publication lag policy to a transformed
+    latest-snapshot FRED-MD panel.
+    """
+    registry_path = registry_path or _DEFAULT_PUB_LAG_REGISTRY
+    if not os.path.isabs(registry_path):
+        registry_path = os.path.join(_REPO_ROOT, registry_path)
+    registry = load_publication_lag_registry(registry_path)
+    return apply_publication_lag_to_panel(fred_md, registry=registry)
 
 
 def get_yields(type: str, start: str, end: str, maturities: list) -> pd.DataFrame:
