@@ -347,3 +347,94 @@ class PCABaselineModelMacroGroupsHYPERGRID:
         features_scaled = self.scaler_features.transform(features)
         
         return self.model.predict(features_scaled)
+
+
+
+
+class PCAFirst8PCsWithCPModel:
+    def __init__(self, xr_full, cp_cols, components=8, n_cp_forwards=5):
+        self.xr_full = xr_full
+        self.cp_cols = cp_cols
+        self.components = components
+        self.n_cp_forwards = n_cp_forwards
+
+        self.scaler_macro = sklearn.preprocessing.StandardScaler()
+        self.pca = sklearn.decomposition.PCA(n_components=components)
+
+        self.cp_model = sklearn.linear_model.LinearRegression()
+        self.model = sklearn.linear_model.LinearRegression()
+
+    def fit(self, X, y, X_val=None, y_val=None):
+        macro = X['macro']
+        forward = X['forward'].iloc[:, :self.n_cp_forwards]
+
+        macro_scaled = self.scaler_macro.fit_transform(macro)
+        macro_pcs = self.pca.fit_transform(macro_scaled)
+
+        cp_target = self.xr_full.loc[X.index, self.cp_cols].mean(axis=1)
+        self.cp_model.fit(forward, cp_target)
+        cp_factor = self.cp_model.predict(forward).reshape(-1, 1)
+
+        features = np.concatenate([cp_factor, macro_pcs], axis=1)
+        self.model.fit(features, y)
+
+    def predict(self, X):
+        macro = X['macro']
+        forward = X['forward'].iloc[:, :self.n_cp_forwards]
+
+        macro_scaled = self.scaler_macro.transform(macro)
+        macro_pcs = self.pca.transform(macro_scaled)
+
+        cp_factor = self.cp_model.predict(forward).reshape(-1, 1)
+
+        features = np.concatenate([cp_factor, macro_pcs], axis=1)
+        return self.model.predict(features)
+
+
+class LudvigsonNgWithCPModel:
+    def __init__(self, xr_full, n_factors=8, n_cp_forwards=5):
+        self.xr_full = xr_full
+        self.n_factors = n_factors
+        self.n_cp_forwards = n_cp_forwards
+
+        self.scaler_macro = sklearn.preprocessing.StandardScaler()
+        self.pca = sklearn.decomposition.PCA(n_components=n_factors)
+
+        self.cp_model = sklearn.linear_model.LinearRegression()
+        self.model = sklearn.linear_model.LinearRegression()
+
+    def fit(self, X, y, X_val=None, y_val=None):
+        macro = X['macro']
+        forward = X['forward'].iloc[:, :self.n_cp_forwards]
+
+        macro_scaled = self.scaler_macro.fit_transform(macro)
+        factors = self.pca.fit_transform(macro_scaled)
+
+        cp_target = self.xr_full.loc[X.index].mean(axis=1)
+        self.cp_model.fit(forward, cp_target)
+        cp_factor = self.cp_model.predict(forward).reshape(-1, 1)
+
+        F1 = factors[:, [0]]
+        F3 = factors[:, [2]]
+        F4 = factors[:, [3]]
+        F8 = factors[:, [7]]
+
+        features = np.concatenate([cp_factor, F1, F1**3, F3, F4, F8], axis=1)
+        self.model.fit(features, y)
+
+    def predict(self, X):
+        macro = X['macro']
+        forward = X['forward'].iloc[:, :self.n_cp_forwards]
+
+        macro_scaled = self.scaler_macro.transform(macro)
+        factors = self.pca.transform(macro_scaled)
+
+        cp_factor = self.cp_model.predict(forward).reshape(-1, 1)
+
+        F1 = factors[:, [0]]
+        F3 = factors[:, [2]]
+        F4 = factors[:, [3]]
+        F8 = factors[:, [7]]
+
+        features = np.concatenate([cp_factor, F1, F1**3, F3, F4, F8], axis=1)
+        return self.model.predict(features)
