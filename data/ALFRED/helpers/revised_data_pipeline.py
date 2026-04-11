@@ -587,7 +587,9 @@ def _vintage_file(base: Path, decision: pd.Timestamp) -> Path | None:
     # month. That gives the intended behavior:
     # - decision on 2020-01-31 -> use 2020-01 vintage
     # - decision on 2020-01-01 -> use 2019-12 vintage
-    # - before the first published vintage month -> no vintage available
+    # - before the first published vintage month -> no same-month vintage
+    #   available, so anchor backfill may need to fall back to the earliest
+    #   archived vintage for that series instead
     decision = pd.Timestamp(decision)
     month_end = _month_end(decision)
     vintage_month = month_end if decision.normalize() == month_end else _month_end(month_end - pd.DateOffset(months=1))
@@ -599,6 +601,49 @@ def _vintage_file(base: Path, decision: pd.Timestamp) -> Path | None:
     if p.exists():
         return p
     return None
+
+
+def _vintage_month_from_path(path: Path) -> pd.Timestamp | None:
+    try:
+        return _month_end(f"{path.stem}-01")
+    except Exception:
+        return None
+
+
+def _earliest_series_anchor_vintages(
+    vintage_dirs: list[Path], series_names: list[str]
+) -> dict[str, tuple[pd.Timestamp, Path]]:
+    remaining = set(series_names)
+    anchors: dict[str, tuple[pd.Timestamp, Path]] = {}
+    vintage_files: list[tuple[pd.Timestamp, Path]] = []
+    seen_paths: set[str] = set()
+
+    for base in vintage_dirs:
+        if not base.exists():
+            continue
+        for path in base.rglob("*.csv"):
+            key = str(path.resolve())
+            if key in seen_paths:
+                continue
+            month = _vintage_month_from_path(path)
+            if month is None:
+                continue
+            seen_paths.add(key)
+            vintage_files.append((month, path))
+
+    vintage_files.sort(key=lambda item: (item[0], str(item[1])))
+    for month, path in vintage_files:
+        if not remaining:
+            break
+        try:
+            cols = {str(c) for c in pd.read_csv(path, nrows=0).columns}
+        except Exception:
+            continue
+        for series in list(remaining):
+            if series in cols:
+                anchors[series] = (month, path)
+                remaining.remove(series)
+    return anchors
 
 
 def apply_anchor_backfill_to_balanced(
@@ -626,6 +671,7 @@ def apply_anchor_backfill_to_balanced(
 
     cache: dict[Path, pd.DataFrame] = {}
     counts: dict[str, int] = {}
+    anchor_vintages = _earliest_series_anchor_vintages(vintage_dirs, series_names)
 
     for d in raw.index:
         for s in series_names:
@@ -651,6 +697,25 @@ def apply_anchor_backfill_to_balanced(
                     counts[s] = counts.get(s, 0) + 1
                     filled = True
                     break
+
+            # If the decision date predates the first archived historical
+            # vintage for this series, backfill from that earliest archived
+            # vintage before falling back to the latest non-revised panel.
+            if not filled:
+                anchor_meta = anchor_vintages.get(s)
+                if anchor_meta is not None:
+                    anchor_month, anchor_path = anchor_meta
+                    if pd.Timestamp(d) < anchor_month:
+                        if anchor_path not in cache:
+                            cache[anchor_path] = _load_vintage(anchor_path)
+                        vm = cache[anchor_path]
+                        if not vm.empty and s in vm.columns and obs_date in vm.index:
+                            v = vm.at[obs_date, s]
+                            if pd.notna(v):
+                                raw.at[d, s] = float(v)
+                                src.at[d, s] = tag
+                                counts[s] = counts.get(s, 0) + 1
+                                filled = True
 
             if filled or s not in nonrev.columns:
                 continue
