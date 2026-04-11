@@ -12,21 +12,15 @@ import numpy as np
 import pandas as pd
 import requests
 
-try:
-    from utils.publication_lags import (
-        PUB_LAG_COLUMNS,
-        default_publication_lag_policy,
-        lagged_observation_date,
-    )
-except ModuleNotFoundError:
-    REPO_ROOT = Path(__file__).resolve().parents[3]
-    if str(REPO_ROOT) not in sys.path:
-        sys.path.insert(0, str(REPO_ROOT))
-    from utils.publication_lags import (
-        PUB_LAG_COLUMNS,
-        default_publication_lag_policy,
-        lagged_observation_date,
-    )
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from utils.publication_lags import (
+    PUB_LAG_COLUMNS,
+    default_publication_lag_policy,
+    lagged_observation_date,
+)
 
 API_BASE = "https://api.stlouisfed.org/fred"
 RETRY_STATUS = {429, 500, 502, 503, 504}
