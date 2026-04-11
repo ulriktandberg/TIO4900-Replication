@@ -42,7 +42,7 @@ class _MLPNetwork(nn.Module):
         for i, hidden_dim in enumerate(archi):
             layers.append(nn.Linear(current_dim, hidden_dim))
             layers.append(nn.ReLU()) # Standard ReLU activation
-           
+
             # Apply Batch Normalization to the activations after the last ReLU layer
             if i == len(archi) - 1:
                 layers.append(nn.BatchNorm1d(hidden_dim))
@@ -173,9 +173,15 @@ class PyTorchMLPWrapper:
             for penalty in self.param_grid['penalty']:
                 self._set_seed()
                 temp_model = _MLPNetwork(input_dim=input_dim, archi=self.archi, output_dim=output_dim)
-                temp_optimizer = optim.SGD(
-                    temp_model.parameters(), lr=self.lr, momentum=self.momentum,
-                    nesterov=True, weight_decay=penalty
+                # temp_optimizer = optim.SGD(
+                #     temp_model.parameters(), lr=self.lr, momentum=self.momentum,
+                #     nesterov=True, weight_decay=penalty
+                # )
+                
+                temp_optimizer = optim.Adam(
+                    temp_model.parameters(),
+                    lr=self.lr,
+                    weight_decay=penalty,
                 )
                
                 early_stopper = EarlyStopping(patience=self.patience)
@@ -218,12 +224,18 @@ class PyTorchMLPWrapper:
             self._set_seed()
             self.model = _MLPNetwork(input_dim=input_dim, archi=self.archi, output_dim=output_dim)
            
-            self.optimizer = optim.SGD(
+            # self.optimizer = optim.SGD(
+            #     self.model.parameters(),
+            #     lr=self.lr,
+            #     momentum=self.momentum,
+            #     nesterov=True,
+            #     weight_decay=current_penalty
+            # )
+
+            self.optimizer = optim.Adam(
                 self.model.parameters(),
                 lr=self.lr,
-                momentum=self.momentum,
-                nesterov=True,
-                weight_decay=current_penalty
+                weight_decay=current_penalty,
             )
         else:
             # If using warm start, ensure the optimizer uses the current best penalty for L2 weight decay

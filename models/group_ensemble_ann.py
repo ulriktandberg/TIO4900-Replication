@@ -41,7 +41,8 @@ class _GroupEnsembleMLPNetwork(nn.Module):
         current_dim = input_dim_fwd
         for i, hidden_dim in enumerate(archi_fwd):
             fwd_layers.append(nn.Linear(current_dim, hidden_dim))
-            fwd_layers.append(nn.Tanh())
+            fwd_layers.append(nn.ReLU())
+            
             if i == len(archi_fwd) - 1:
                 fwd_layers.append(nn.BatchNorm1d(hidden_dim))
             current_dim = hidden_dim
@@ -57,7 +58,8 @@ class _GroupEnsembleMLPNetwork(nn.Module):
             current_dim = input_dim_group
             for i, hidden_dim in enumerate(archi_macro):
                 group_layers.append(nn.Linear(current_dim, hidden_dim))
-                group_layers.append(nn.Tanh())
+                group_layers.append(nn.ReLU())
+
                 if dropout_rate > 0:
                     group_layers.append(nn.Dropout(dropout_rate))
                 if i == len(archi_macro) - 1:
@@ -233,9 +235,15 @@ class GroupEnsembleANNWrapper:
                         output_dim=output_dim,
                         dropout_rate=dropout_rate
                     )
-                    temp_optimizer = optim.SGD(
-                        temp_model.parameters(), lr=self.lr, momentum=self.momentum,
-                        nesterov=True, weight_decay=penalty
+                    # temp_optimizer = optim.SGD(
+                    #     temp_model.parameters(), lr=self.lr, momentum=self.momentum,
+                    #     nesterov=True, weight_decay=penalty
+                    # )
+
+                    temp_optimizer = optim.Adam(
+                        temp_model.parameters(),
+                        lr=self.lr,
+                        weight_decay=penalty,
                     )
                    
                     early_stopper = EarlyStopping(patience=self.patience)
@@ -290,12 +298,18 @@ class GroupEnsembleANNWrapper:
                 output_dim=output_dim,
                 dropout_rate=current_dropout_rate
             )
-            self.optimizer = optim.SGD(
+            # self.optimizer = optim.SGD(
+            #     self.model.parameters(),
+            #     lr=self.lr,
+            #     momentum=self.momentum,
+            #     nesterov=True,
+            #     weight_decay=current_penalty
+            # )
+
+            self.optimizer = optim.Adam(
                 self.model.parameters(),
                 lr=self.lr,
-                momentum=self.momentum,
-                nesterov=True,
-                weight_decay=current_penalty
+                weight_decay=current_penalty,
             )
         else:
             # If using warm start, ensure the optimizer uses the current best penalty for L2 weight decay
