@@ -20,6 +20,7 @@ from utils.publication_lags import (
     PUB_LAG_COLUMNS,
     default_publication_lag_policy,
     lagged_observation_date,
+    resolve_publication_lag_months,
 )
 
 API_BASE = "https://api.stlouisfed.org/fred"
@@ -610,6 +611,35 @@ def _vintage_month_from_path(path: Path) -> pd.Timestamp | None:
         return None
 
 
+def _pick_from_vintage_frame(
+    vintage_frame: pd.DataFrame,
+    series_name: str,
+    obs_date: pd.Timestamp,
+    max_release_gap_months: int = 1,
+) -> float:
+    if vintage_frame.empty or series_name not in vintage_frame.columns:
+        return np.nan
+
+    series = pd.to_numeric(vintage_frame[series_name], errors="coerce").dropna()
+    if series.empty:
+        return np.nan
+
+    obs_date = _month_end(obs_date)
+    if obs_date in series.index:
+        value = series.loc[obs_date]
+        if pd.notna(value):
+            return float(value)
+
+    eligible = series.loc[series.index <= obs_date]
+    if eligible.empty:
+        return np.nan
+
+    last_obs_date = pd.Timestamp(eligible.index[-1])
+    if _months_between(obs_date, last_obs_date) <= int(max_release_gap_months):
+        return float(eligible.iloc[-1])
+    return np.nan
+
+
 def _earliest_series_anchor_vintages(
     vintage_dirs: list[Path], series_names: list[str]
 ) -> dict[str, tuple[pd.Timestamp, Path]]:
@@ -653,6 +683,7 @@ def apply_anchor_backfill_to_balanced(
     nonrev_raw: pd.DataFrame,
     vintage_dirs: list[Path],
     tag: str = SOURCE_PRE_VINTAGE,
+    max_release_gap_months: int = 1,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, int]]:
     raw = raw_bal.copy()
     src = src_bal.copy()
@@ -679,6 +710,7 @@ def apply_anchor_backfill_to_balanced(
                 continue
             lag_meta = reg.loc[s]
             obs_date = lagged_observation_date(d, lag_meta)
+            vintage_gap_months = max(int(max_release_gap_months), resolve_publication_lag_months(lag_meta, d))
 
             filled = False
             for base in vintage_dirs:
@@ -688,9 +720,9 @@ def apply_anchor_backfill_to_balanced(
                 if vp not in cache:
                     cache[vp] = _load_vintage(vp)
                 vm = cache[vp]
-                if vm.empty or s not in vm.columns or obs_date not in vm.index:
+                if vm.empty or s not in vm.columns:
                     continue
-                v = vm.at[obs_date, s]
+                v = _pick_from_vintage_frame(vm, s, obs_date, max_release_gap_months=vintage_gap_months)
                 if pd.notna(v):
                     raw.at[d, s] = float(v)
                     src.at[d, s] = tag
@@ -709,8 +741,8 @@ def apply_anchor_backfill_to_balanced(
                         if anchor_path not in cache:
                             cache[anchor_path] = _load_vintage(anchor_path)
                         vm = cache[anchor_path]
-                        if not vm.empty and s in vm.columns and obs_date in vm.index:
-                            v = vm.at[obs_date, s]
+                        if not vm.empty and s in vm.columns:
+                            v = _pick_from_vintage_frame(vm, s, obs_date, max_release_gap_months=vintage_gap_months)
                             if pd.notna(v):
                                 raw.at[d, s] = float(v)
                                 src.at[d, s] = tag
