@@ -7,6 +7,8 @@ seaborn
 matplotlib
 tqdm
 xgboost
+lightgbm
 ipykernel
 requests
 openpyxl
+statsmodels
