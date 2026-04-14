@@ -392,9 +392,10 @@ class PCAFirst8PCsWithCPModel:
 
 
 class LudvigsonNgWithCPModel:
-    def __init__(self, xr_full, n_factors=8, n_cp_forwards=5):
+    def __init__(self, xr_full, cp_cols, n_factors=8, n_cp_forwards=5):
         self.xr_full = xr_full
-        self.n_factors = n_factors
+        self.cp_cols = cp_cols
+        self.n_factors = max(n_factors, 8)
         self.n_cp_forwards = n_cp_forwards
 
         self.scaler_macro = sklearn.preprocessing.StandardScaler()
@@ -410,7 +411,7 @@ class LudvigsonNgWithCPModel:
         macro_scaled = self.scaler_macro.fit_transform(macro)
         factors = self.pca.fit_transform(macro_scaled)
 
-        cp_target = self.xr_full.loc[X.index].mean(axis=1)
+        cp_target = self.xr_full.loc[X.index, self.cp_cols].mean(axis=1)
         self.cp_model.fit(forward, cp_target)
         cp_factor = self.cp_model.predict(forward).reshape(-1, 1)
 
@@ -419,6 +420,7 @@ class LudvigsonNgWithCPModel:
         F4 = factors[:, [3]]
         F8 = factors[:, [7]]
 
+        #features = np.concatenate([cp_factor, factors[:, :8]], axis=1) #used to check whether similar results to PCAFirst8PCsWithCPModel
         features = np.concatenate([cp_factor, F1, F1**3, F3, F4, F8], axis=1)
         self.model.fit(features, y)
 
@@ -437,4 +439,6 @@ class LudvigsonNgWithCPModel:
         F8 = factors[:, [7]]
 
         features = np.concatenate([cp_factor, F1, F1**3, F3, F4, F8], axis=1)
+        #features = np.concatenate([cp_factor, factors[:, :8]], axis=1)
         return self.model.predict(features)
+
