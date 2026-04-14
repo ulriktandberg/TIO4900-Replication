@@ -19,12 +19,12 @@ if str(_REPO_ROOT) not in sys.path:
 from utils.publication_lags import (
     PUB_LAG_COLUMNS,
     default_publication_lag_policy,
-    lagged_observation_date,
     resolve_publication_lag_months,
 )
 
 API_BASE = "https://api.stlouisfed.org/fred"
 RETRY_STATUS = {429, 500, 502, 503, 504}
+OPEN_END_SENTINEL = pd.Timestamp("2262-04-11").normalize()
 
 REGISTRY_COLUMNS = [
     "hs_no",
@@ -89,6 +89,13 @@ SOURCE_RELEASE_GAP = "FILL_RELEASE_GAP"
 SOURCE_PRE_VINTAGE = "FILL_PRE_VINTAGE_EARLIEST"
 SOURCE_NONREV = "FILL_NONREVISED_FRED"
 
+SERIES_DECISION_START_OVERRIDES = {
+    "HWI": pd.Timestamp("2000-12-31"),
+    "HWIURATIO": pd.Timestamp("2010-08-31"),
+}
+
+SERIES_BLOCK_PRE_ARCHIVE_EXTERNAL_FALLBACK = {"USTPU"}
+
 
 class RegistryError(ValueError):
     pass
@@ -137,6 +144,23 @@ def _json_list(value: Any) -> list[str]:
     if not isinstance(parsed, list):
         raise RegistryError("component_series_ids must decode to list")
     return [_clean(x) for x in parsed if _clean(x)]
+
+
+def _parse_realtime_end(values: pd.Series | Any) -> pd.Series:
+    """
+    Parse ALFRED realtime_end values while preserving open-ended vintages.
+
+    ALFRED uses 9999-12-31 for currently active vintages, which is outside the
+    pandas nanosecond timestamp range. Coercing directly to datetime turns
+    those rows into NaT and makes current vintages invisible to as-of
+    selection. We map them to the largest safe timestamp instead.
+    """
+    s = pd.Series(values, copy=False)
+    text = s.astype(str).str.strip()
+    out = pd.to_datetime(s, errors="coerce")
+    open_mask = text.eq("9999-12-31")
+    out = out.where(~open_mask, OPEN_END_SENTINEL)
+    return out.fillna(OPEN_END_SENTINEL)
 
 
 def _cutoff(decision_date: pd.Timestamp, release_rule: str) -> pd.Timestamp:
@@ -309,10 +333,10 @@ def _fetch_history(ctx: FetchContext, series_id: str, start: pd.Timestamp, end: 
     f["obs_date"] = pd.to_datetime(f.get("date"), errors="coerce")
     if used_relaxed_fallback:
         f["realtime_start"] = pd.Timestamp("1900-01-01")
-        f["realtime_end"] = pd.Timestamp("2262-04-11")
+        f["realtime_end"] = OPEN_END_SENTINEL
     else:
         f["realtime_start"] = pd.to_datetime(f.get("realtime_start"), errors="coerce")
-        f["realtime_end"] = pd.to_datetime(f.get("realtime_end"), errors="coerce")
+        f["realtime_end"] = _parse_realtime_end(f.get("realtime_end"))
     f["value"] = pd.to_numeric(f.get("value"), errors="coerce")
     f = f[["series_id", "obs_date", "realtime_start", "realtime_end", "value"]]
     return f.dropna(subset=["obs_date"]).sort_values(["obs_date", "realtime_start", "realtime_end"]).reset_index(drop=True)
@@ -406,13 +430,16 @@ def load_cache(cache_path: Path) -> dict[str, pd.DataFrame]:
     if "realtime_start" not in comp.columns:
         comp["realtime_start"] = pd.Timestamp.min.normalize()
     if "realtime_end" not in comp.columns:
-        comp["realtime_end"] = pd.Timestamp.max.normalize()
+        comp["realtime_end"] = OPEN_END_SENTINEL
     out["component_history"] = comp
 
     for col in ["obs_date", "realtime_start", "realtime_end", "obs_min_date", "obs_max_date"]:
         for name in ["component_history", "availability_audit"]:
             if col in out[name].columns:
-                out[name][col] = pd.to_datetime(out[name][col], errors="coerce")
+                if name == "component_history" and col == "realtime_end":
+                    out[name][col] = _parse_realtime_end(out[name][col])
+                else:
+                    out[name][col] = pd.to_datetime(out[name][col], errors="coerce")
     return out
 
 
@@ -426,29 +453,51 @@ def _history_map(history: pd.DataFrame) -> dict[str, pd.DataFrame]:
     return out
 
 
+def _first_available_vintage_start(hist: pd.DataFrame | None) -> pd.Timestamp | None:
+    if hist is None or hist.empty or "realtime_start" not in hist.columns:
+        return None
+    first_available = pd.to_datetime(hist["realtime_start"], errors="coerce").dropna()
+    if first_available.empty:
+        return None
+    return pd.Timestamp(first_available.min())
+
+
+def _series_decision_start(row: pd.Series) -> pd.Timestamp | None:
+    series_name = _clean(row.get("mnemonic_hs"))
+    start = SERIES_DECISION_START_OVERRIDES.get(series_name)
+    if start is None:
+        return None
+    return _month_end(start)
+
+
 def _pick(hist: pd.DataFrame | None, decision: pd.Timestamp, cutoff_date: pd.Timestamp, mode: str) -> tuple[float, pd.Timestamp | None]:
     if hist is None or hist.empty:
         return np.nan, None
 
-    # Balanced fallback modes may use relaxed vintage selection, but they
-    # should never make a series available before its first published vintage.
-    if mode != "strict_asof" and "realtime_start" in hist.columns:
-        first_available = pd.to_datetime(hist["realtime_start"], errors="coerce").dropna()
-        if not first_available.empty and pd.Timestamp(decision) < first_available.min():
-            return np.nan, None
-
+    first_available = _first_available_vintage_start(hist)
     c = hist[hist["obs_date"] <= cutoff_date]
     if c.empty:
         return np.nan, None
 
     if mode == "strict_asof":
-        c = c[(c["realtime_start"] <= decision) & (c["realtime_end"] >= decision)]
+        rt_end = pd.to_datetime(c["realtime_end"], errors="coerce").fillna(OPEN_END_SENTINEL)
+        c = c[(c["realtime_start"] <= decision) & (rt_end >= decision)]
         if c.empty:
             return np.nan, pd.NaT
         r = c.iloc[-1]
     elif mode == "earliest":
-        r = c.iloc[0]
+        # Pre-vintage fill should use the earliest available ALFRED vintage,
+        # but only before the series first becomes observable in real time.
+        if first_available is None or pd.Timestamp(decision) >= first_available:
+            return np.nan, None
+        rt_end = pd.to_datetime(c["realtime_end"], errors="coerce").fillna(OPEN_END_SENTINEL)
+        c = c[(c["realtime_start"] <= first_available) & (rt_end >= first_available)]
+        if c.empty:
+            return np.nan, pd.NaT
+        r = c.iloc[-1]
     else:
+        if first_available is not None and pd.Timestamp(decision) < first_available:
+            return np.nan, None
         r = c.iloc[-1]
     return (float(r["value"]) if pd.notna(r["value"]) else np.nan), r["obs_date"]
 
@@ -461,6 +510,9 @@ def _value_for(
     max_release_gap_months: int,
 ) -> float:
     ctype = _clean(row.get("construction_type"))
+    series_start = _series_decision_start(row)
+    if series_start is not None and pd.Timestamp(decision) < series_start:
+        return np.nan
     cutoff_date = _cutoff(decision, _clean(row.get("release_rule")))
 
     def latest_or_gap(sid: str, pick_mode: str) -> float:
@@ -473,9 +525,14 @@ def _value_for(
             return np.nan
         return val
 
-    if ctype == "direct_alfred" and mode == "strict":
+    if ctype == "direct_alfred" and mode in {"strict", "release_gap"}:
         sid = _clean(row.get("target_series_id")) or _clean(row.get("mnemonic_hs"))
-        val, _ = _pick(history.get(sid), decision, cutoff_date, "strict_asof")
+        val, obs = _pick(history.get(sid), decision, cutoff_date, "strict_asof")
+        if pd.isna(val) or pd.isna(obs):
+            return np.nan
+        max_obs_gap = max(int(max_release_gap_months), resolve_publication_lag_months(row, decision))
+        if _months_between(cutoff_date, pd.Timestamp(obs)) > max_obs_gap:
+            return np.nan
         return val
 
     if ctype in {"direct_alfred", "direct_fred", "public_proxy"}:
@@ -486,10 +543,28 @@ def _value_for(
         comps = _json_list(row.get("component_series_ids"))
         if not comps:
             return np.nan
-        vals = {
-            c: latest_or_gap(c, "earliest" if mode == "pre_vintage" else "latest")
-            for c in comps
-        }
+
+        def component_strict_asof(sid: str) -> float:
+            val, obs = _pick(history.get(sid), decision, cutoff_date, "strict_asof")
+            if pd.isna(val) or pd.isna(obs):
+                return np.nan
+            comp_meta = {"mnemonic_hs": sid}
+            max_obs_gap = max(
+                int(max_release_gap_months),
+                resolve_publication_lag_months(row, decision),
+                resolve_publication_lag_months(comp_meta, decision),
+            )
+            if _months_between(cutoff_date, pd.Timestamp(obs)) > max_obs_gap:
+                return np.nan
+            return val
+
+        if mode in {"strict", "release_gap"}:
+            vals = {c: component_strict_asof(c) for c in comps}
+        else:
+            vals = {
+                c: latest_or_gap(c, "earliest" if mode == "pre_vintage" else "latest")
+                for c in comps
+            }
         if any(pd.isna(v) for v in vals.values()):
             return np.nan
         out = pd.eval(_clean(row.get("raw_formula")), local_dict=vals, engine="python")
@@ -614,7 +689,7 @@ def _vintage_month_from_path(path: Path) -> pd.Timestamp | None:
 def _pick_from_vintage_frame(
     vintage_frame: pd.DataFrame,
     series_name: str,
-    obs_date: pd.Timestamp,
+    cutoff_date: pd.Timestamp,
     max_release_gap_months: int = 1,
 ) -> float:
     if vintage_frame.empty or series_name not in vintage_frame.columns:
@@ -624,18 +699,18 @@ def _pick_from_vintage_frame(
     if series.empty:
         return np.nan
 
-    obs_date = _month_end(obs_date)
-    if obs_date in series.index:
-        value = series.loc[obs_date]
+    cutoff_date = _month_end(cutoff_date)
+    if cutoff_date in series.index:
+        value = series.loc[cutoff_date]
         if pd.notna(value):
             return float(value)
 
-    eligible = series.loc[series.index <= obs_date]
+    eligible = series.loc[series.index <= cutoff_date]
     if eligible.empty:
         return np.nan
 
     last_obs_date = pd.Timestamp(eligible.index[-1])
-    if _months_between(obs_date, last_obs_date) <= int(max_release_gap_months):
+    if _months_between(cutoff_date, last_obs_date) <= int(max_release_gap_months):
         return float(eligible.iloc[-1])
     return np.nan
 
@@ -699,6 +774,7 @@ def apply_anchor_backfill_to_balanced(
             reg[col] = reg["mnemonic_hs"].astype(str).map(lambda s: default_publication_lag_policy(s)[col])
     reg = reg.set_index("mnemonic_hs", drop=False)
     series_names = reg.index.astype(str).tolist()
+    series_start_dates = {s: _series_decision_start(reg.loc[s]) for s in series_names}
 
     cache: dict[Path, pd.DataFrame] = {}
     counts: dict[str, int] = {}
@@ -709,8 +785,16 @@ def apply_anchor_backfill_to_balanced(
             if s not in raw.columns or pd.notna(raw.at[d, s]):
                 continue
             lag_meta = reg.loc[s]
-            obs_date = lagged_observation_date(d, lag_meta)
+            series_start = series_start_dates.get(s)
+            if series_start is not None and pd.Timestamp(d) < series_start:
+                continue
+            cutoff_date = _cutoff(d, _clean(lag_meta.get("release_rule")))
             vintage_gap_months = max(int(max_release_gap_months), resolve_publication_lag_months(lag_meta, d))
+            started_mask = (src.index < pd.Timestamp(d)) & src[s].astype(str).isin(
+                [SOURCE_STRICT, SOURCE_RELEASE_GAP, SOURCE_PRE_VINTAGE]
+            )
+            series_started = bool(started_mask.any())
+            block_pre_archive_external = s in SERIES_BLOCK_PRE_ARCHIVE_EXTERNAL_FALLBACK and series_started
 
             filled = False
             for base in vintage_dirs:
@@ -722,7 +806,7 @@ def apply_anchor_backfill_to_balanced(
                 vm = cache[vp]
                 if vm.empty or s not in vm.columns:
                     continue
-                v = _pick_from_vintage_frame(vm, s, obs_date, max_release_gap_months=vintage_gap_months)
+                v = _pick_from_vintage_frame(vm, s, cutoff_date, max_release_gap_months=vintage_gap_months)
                 if pd.notna(v):
                     raw.at[d, s] = float(v)
                     src.at[d, s] = tag
@@ -737,12 +821,12 @@ def apply_anchor_backfill_to_balanced(
                 anchor_meta = anchor_vintages.get(s)
                 if anchor_meta is not None:
                     anchor_month, anchor_path = anchor_meta
-                    if pd.Timestamp(d) < anchor_month:
+                    if pd.Timestamp(d) < anchor_month and not block_pre_archive_external:
                         if anchor_path not in cache:
                             cache[anchor_path] = _load_vintage(anchor_path)
                         vm = cache[anchor_path]
                         if not vm.empty and s in vm.columns:
-                            v = _pick_from_vintage_frame(vm, s, obs_date, max_release_gap_months=vintage_gap_months)
+                            v = _pick_from_vintage_frame(vm, s, cutoff_date, max_release_gap_months=vintage_gap_months)
                             if pd.notna(v):
                                 raw.at[d, s] = float(v)
                                 src.at[d, s] = tag
@@ -751,9 +835,11 @@ def apply_anchor_backfill_to_balanced(
 
             if filled or s not in nonrev.columns:
                 continue
-            v = nonrev.at[obs_date, s] if obs_date in nonrev.index else np.nan
+            if anchor_meta is not None and pd.Timestamp(d) < anchor_month and block_pre_archive_external:
+                continue
+            v = nonrev.at[cutoff_date, s] if cutoff_date in nonrev.index else np.nan
             if pd.isna(v):
-                past = nonrev.loc[nonrev.index <= obs_date, s].dropna()
+                past = nonrev.loc[nonrev.index <= cutoff_date, s].dropna()
                 if not past.empty:
                     v = past.iloc[-1]
             if pd.notna(v):
