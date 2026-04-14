@@ -1,12 +1,22 @@
 import os
 import pandas as pd
-from typing import Tuple
+from typing import Iterable, Tuple
 import numpy as np
 import statsmodels.api as sm
 from scipy.stats import t as tstat
 
 # Repo root: one level up from utils/
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_PROJECT_DEFAULT_MACRO_DROP_SERIES = ("TWEXAFEGSMTHx", "ACOGNO")
+
+
+def _slice_month_end_panel(panel: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
+    """Normalize a macro panel to month-end timestamps, sort it, and slice dates."""
+    out = panel.copy()
+    out.index = pd.to_datetime(out.index) + pd.offsets.MonthEnd(0)
+    out.index.name = "date"
+    out = out.sort_index()
+    return out.loc[start:end]
 
 def load_fred_md_data(filepath: str) -> Tuple[pd.DataFrame, pd.Series]:
     """
@@ -143,7 +153,37 @@ def get_fred_data(filepath: str, start: str, end: str) -> pd.DataFrame:
         fred_raw['UMCSENTx'] = fred_raw['UMCSENTx'].ffill()
 
     fred_md = apply_fred_transformations(fred_raw, transform_codes)
-    return fred_md[start:end]
+    return _slice_month_end_panel(fred_md, start, end)
+
+
+def get_realtime_fred_data(
+    start: str,
+    end: str,
+    filepath: str = "data/ALFRED/simple_outputs/realtime_tcode_balanced.csv",
+) -> pd.DataFrame:
+    """Load the transformed balanced real-time macro panel for the requested sample."""
+    if not os.path.isabs(filepath):
+        filepath = os.path.join(_REPO_ROOT, filepath)
+
+    realtime = pd.read_csv(filepath, index_col="decision_date")
+    for col in realtime.columns:
+        realtime[col] = pd.to_numeric(realtime[col], errors="coerce")
+
+    return _slice_month_end_panel(realtime, start, end)
+
+
+def prepare_macro_panel_for_project(
+    panel: pd.DataFrame,
+    *,
+    extra_drop_series: Iterable[str] = (),
+) -> pd.DataFrame:
+    """Apply the project's standard macro exclusions plus any comparison-specific drops."""
+    out = panel.copy()
+    drop_series = list(dict.fromkeys((*_PROJECT_DEFAULT_MACRO_DROP_SERIES, *extra_drop_series)))
+    existing = [col for col in drop_series if col in out.columns]
+    if existing:
+        out = out.drop(columns=existing)
+    return out
 
 
 def get_yields(type: str, start: str, end: str, maturities: list) -> pd.DataFrame:
