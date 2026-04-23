@@ -1,14 +1,48 @@
 import numpy as np
+import pandas as pd
 from copy import deepcopy
 from tqdm.auto import tqdm
 
-def expanding_window(model_class, X, y, dates, oos_start, 
+def _realtime_feature_frame(X, panel_transformed, t):
+    X_current = X.iloc[: t + 1].copy()
+    macro = panel_transformed.reindex(X_current.index)
+
+    if isinstance(X_current.columns, pd.MultiIndex):
+        top_level = X_current.columns.get_level_values(0)
+        if "fred" not in top_level:
+            raise ValueError(
+                "realtime=True requires a 'fred' feature block in the first column level."
+            )
+        fred_cols = X_current.loc[:, top_level == "fred"].columns
+        fred_series = list(fred_cols.get_level_values(-1))
+        missing = [name for name in dict.fromkeys(fred_series) if name not in macro.columns]
+        if missing:
+            raise ValueError(
+                "Forecast-vintage panel is missing required macro columns: "
+                f"{missing}"
+            )
+        X_current.loc[:, fred_cols] = macro.reindex(columns=fred_series).to_numpy()
+        return X_current
+
+    missing = [name for name in X_current.columns if name not in macro.columns]
+    if missing:
+        raise ValueError(
+            "realtime=True with a flat-column design matrix expects macro-only columns. "
+            f"Missing forecast-vintage columns: {missing}"
+        )
+    X_current.loc[:, X_current.columns] = macro.reindex(columns=X_current.columns).to_numpy()
+    return X_current
+
+
+def expanding_window(model_class, X, y, dates, oos_start,
                      gap=0, refit_freq=1, coef_callback=None,
                      save_callback=None,
                      progress=True,
                      tqdm_position=None,
                      tqdm_desc="expanding window",
-                     tqdm_leave=False):
+                     tqdm_leave=False,
+                     realtime=False,
+                     realtime_store=None):
     """
     Unified Forecasting Engine.
     """
@@ -19,6 +53,15 @@ def expanding_window(model_class, X, y, dates, oos_start,
 
     oos_indices = np.where(dates >= oos_start)[0]
     model = None
+    realtime_panel_cache = {}
+
+    if realtime:
+        if not isinstance(X, pd.DataFrame):
+            raise ValueError("realtime=True requires X to be a pandas DataFrame.")
+        if realtime_store is None:
+            from utils.forecast_vintages import ForecastVintageMacroStore
+
+            realtime_store = ForecastVintageMacroStore()
 
     iterator = oos_indices
     if progress:
@@ -31,6 +74,20 @@ def expanding_window(model_class, X, y, dates, oos_start,
         )
 
     for i, t in enumerate(iterator):
+        X_current = X
+        realtime_panel = None
+        if realtime:
+            forecast_date = pd.Timestamp(dates[t])
+            realtime_panel = realtime_panel_cache.get(forecast_date)
+            if realtime_panel is None:
+                realtime_panel = realtime_store.panel_for_forecast_date(
+                    forecast_date,
+                    start=dates[0],
+                    end=forecast_date,
+                )
+                realtime_panel_cache[forecast_date] = realtime_panel
+            X_current = _realtime_feature_frame(X, realtime_panel.transformed, t)
+
         if i % refit_freq == 0:
             if model is None:
                 current_model = deepcopy(model_class)
@@ -38,12 +95,18 @@ def expanding_window(model_class, X, y, dates, oos_start,
                 current_model = deepcopy(model)
 
             train_end = t - gap
-            X_train, y_train = X.iloc[:train_end], y[:train_end]
+            X_train, y_train = X_current.iloc[:train_end], y[:train_end]
             current_model.fit(X_train, y_train)
             model = current_model
 
             if save_callback is not None:
-                save_callback(model=current_model, refit_i=i, t_index=t, date_value=dates[t])
+                save_callback(
+                    model=current_model,
+                    refit_i=i,
+                    t_index=t,
+                    date_value=dates[t],
+                    realtime_panel=realtime_panel,
+                )
 
             if coef_callback is not None and hasattr(model, "model"):
                 try:
@@ -53,9 +116,9 @@ def expanding_window(model_class, X, y, dates, oos_start,
 
         # Use sequence architectures' own prediction method if available
         if hasattr(model, "predict_at"):
-            pred = model.predict_at(X, t)
+            pred = model.predict_at(X_current, t)
         else:
-            pred = model.predict(X.iloc[[t]])
+            pred = model.predict(X_current.iloc[[t]])
 
         if y.ndim == 1:
             y_forecast[t] = pred[-1] if isinstance(pred, np.ndarray) else pred
