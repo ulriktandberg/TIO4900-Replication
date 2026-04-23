@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 import pandas as pd
 from sklearn.decomposition import PCA
@@ -12,6 +14,13 @@ try:
     import lightgbm as lgb
 except ModuleNotFoundError:
     lgb = None
+
+
+warnings.filterwarnings(
+    "ignore",
+    message="X does not have valid feature names, but LGBMRegressor was fitted with feature names",
+    category=UserWarning,
+)
 
 
 __all__ = [
@@ -447,6 +456,7 @@ class LightGBMModel(_BaseGBTModel):
         reg_alpha=0.0,
         reg_lambda=0.0,
         random_state=42,
+        verbose=None,
         arch_grid=None,
         tune_every=60,
         impute_strategy=None,
@@ -472,3 +482,5 @@ class LightGBMModel(_BaseGBTModel):
             "random_state": random_state,
             "objective": "regression",
         }
+        if verbose is not None:
+            self.fixed_params["verbose"] = verbose
