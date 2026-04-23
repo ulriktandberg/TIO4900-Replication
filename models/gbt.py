@@ -456,6 +456,8 @@ class LightGBMModel(_BaseGBTModel):
         reg_alpha=0.0,
         reg_lambda=0.0,
         random_state=42,
+        n_jobs=None,
+        force_row_wise=None,
         verbose=None,
         arch_grid=None,
         tune_every=60,
@@ -482,5 +484,9 @@ class LightGBMModel(_BaseGBTModel):
             "random_state": random_state,
             "objective": "regression",
         }
+        if n_jobs is not None:
+            self.fixed_params["n_jobs"] = n_jobs
+        if force_row_wise is not None:
+            self.fixed_params["force_row_wise"] = force_row_wise
         if verbose is not None:
             self.fixed_params["verbose"] = verbose
