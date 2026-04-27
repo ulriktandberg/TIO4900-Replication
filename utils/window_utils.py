@@ -3,6 +3,116 @@ import pandas as pd
 from copy import deepcopy
 from tqdm.auto import tqdm
 
+def _fit_window_imputer(X_train, strategy, all_missing_fill_value):
+    if strategy not in {"median"}:
+        raise ValueError(f"Unsupported impute_strategy: {strategy}")
+
+    if isinstance(X_train, pd.DataFrame):
+        if strategy == "median":
+            fill_values = X_train.median(axis=0, skipna=True)
+        fill_values = fill_values.fillna(all_missing_fill_value)
+        return fill_values
+
+    X_arr = np.asarray(X_train, dtype=float)
+    if X_arr.ndim == 1:
+        X_arr = X_arr.reshape(-1, 1)
+    fill_values = np.nanmedian(X_arr, axis=0)
+    fill_values = np.where(np.isnan(fill_values), all_missing_fill_value, fill_values)
+    return fill_values
+
+
+def _availability_timing_mask(X_values):
+    if isinstance(X_values, pd.DataFrame):
+        mask = pd.DataFrame(False, index=X_values.index, columns=X_values.columns)
+        row_index = X_values.index
+        for col in X_values.columns:
+            series = X_values[col]
+            na = series.isna()
+            if not na.any():
+                continue
+            valid_idx = row_index[series.notna()]
+            if len(valid_idx) == 0:
+                mask[col] = na
+                continue
+            first_valid = valid_idx[0]
+            last_valid = valid_idx[-1]
+            mask[col] = na & ((row_index < first_valid) | (row_index > last_valid))
+        return mask
+
+    X_arr = np.asarray(X_values, dtype=float)
+    if X_arr.ndim == 1:
+        X_arr = X_arr.reshape(-1, 1)
+    mask = np.zeros_like(X_arr, dtype=bool)
+    for j in range(X_arr.shape[1]):
+        col = X_arr[:, j]
+        valid_idx = np.flatnonzero(~np.isnan(col))
+        if len(valid_idx) == 0:
+            mask[:, j] = np.isnan(col)
+            continue
+        first_valid = valid_idx[0]
+        last_valid = valid_idx[-1]
+        idx = np.arange(len(col))
+        mask[:, j] = np.isnan(col) & ((idx < first_valid) | (idx > last_valid))
+    return mask
+
+
+def _apply_window_imputer(X_values, fill_values, preserve_mask=None):
+    if isinstance(X_values, pd.DataFrame):
+        filled = X_values.fillna(fill_values)
+        if preserve_mask is None:
+            return filled
+        return filled.mask(preserve_mask)
+
+    X_arr = np.asarray(X_values, dtype=float)
+    if X_arr.ndim == 1:
+        X_arr = X_arr.reshape(-1, 1)
+    out = X_arr.copy()
+    nan_rows, nan_cols = np.where(np.isnan(out))
+    out[nan_rows, nan_cols] = fill_values[nan_cols]
+    if preserve_mask is not None:
+        out[np.asarray(preserve_mask, dtype=bool)] = np.nan
+    return out
+
+
+def _select_train_available_columns(X_train):
+    if isinstance(X_train, pd.DataFrame):
+        keep = X_train.notna().all(axis=0)
+        return X_train.columns[keep]
+
+    X_arr = np.asarray(X_train, dtype=float)
+    if X_arr.ndim == 1:
+        X_arr = X_arr.reshape(-1, 1)
+    return np.flatnonzero(~np.isnan(X_arr).any(axis=0))
+
+
+def _apply_column_selection(X_values, selected_columns):
+    if isinstance(X_values, pd.DataFrame):
+        return X_values.loc[:, selected_columns]
+
+    X_arr = np.asarray(X_values, dtype=float)
+    if X_arr.ndim == 1:
+        X_arr = X_arr.reshape(-1, 1)
+    return X_arr[:, selected_columns]
+
+
+def _carry_forward_latest(X_values):
+    if isinstance(X_values, pd.DataFrame):
+        return X_values.ffill()
+
+    X_arr = np.asarray(X_values, dtype=float)
+    if X_arr.ndim == 1:
+        X_arr = X_arr.reshape(-1, 1)
+    out = X_arr.copy()
+    for j in range(out.shape[1]):
+        last = np.nan
+        for i in range(out.shape[0]):
+            if np.isnan(out[i, j]):
+                out[i, j] = last
+            else:
+                last = out[i, j]
+    return out
+
+
 def _realtime_feature_frame(X, panel_transformed, t):
     X_current = X.iloc[: t + 1].copy()
     macro = panel_transformed.reindex(X_current.index)
@@ -42,7 +152,12 @@ def expanding_window(model_class, X, y, dates, oos_start,
                      tqdm_desc="expanding window",
                      tqdm_leave=False,
                      realtime=False,
-                     realtime_store=None):
+                     realtime_store=None,
+                     impute_strategy=None,
+                     all_missing_fill_value=0.0,
+                     preserve_availability_timing=True,
+                     drop_unavailable_columns=True,
+                     carry_forward_latest=True):
     """
     Unified Forecasting Engine.
     """
@@ -54,6 +169,7 @@ def expanding_window(model_class, X, y, dates, oos_start,
     oos_indices = np.where(dates >= oos_start)[0]
     model = None
     realtime_panel_cache = {}
+    selected_columns = None
 
     if realtime:
         if not isinstance(X, pd.DataFrame):
@@ -95,7 +211,29 @@ def expanding_window(model_class, X, y, dates, oos_start,
                 current_model = deepcopy(model)
 
             train_end = t - gap
-            X_train, y_train = X_current.iloc[:train_end], y[:train_end]
+            X_model = X_current
+            if impute_strategy is not None:
+                fill_values = _fit_window_imputer(
+                    X_current.iloc[:train_end],
+                    strategy=impute_strategy,
+                    all_missing_fill_value=all_missing_fill_value,
+                )
+                preserve_mask = (
+                    _availability_timing_mask(X_current)
+                    if preserve_availability_timing else None
+                )
+                X_model = _apply_window_imputer(X_current, fill_values, preserve_mask=preserve_mask)
+
+            if drop_unavailable_columns:
+                selected_columns = _select_train_available_columns(X_model.iloc[:train_end])
+                X_model = _apply_column_selection(X_model, selected_columns)
+            else:
+                selected_columns = None
+
+            if carry_forward_latest:
+                X_model = _carry_forward_latest(X_model)
+
+            X_train, y_train = X_model.iloc[:train_end], y[:train_end]
             current_model.fit(X_train, y_train)
             model = current_model
 
@@ -106,6 +244,8 @@ def expanding_window(model_class, X, y, dates, oos_start,
                     t_index=t,
                     date_value=dates[t],
                     realtime_panel=realtime_panel,
+                    impute_strategy=impute_strategy,
+                    selected_columns=selected_columns,
                 )
 
             if coef_callback is not None and hasattr(model, "model"):
@@ -113,12 +253,29 @@ def expanding_window(model_class, X, y, dates, oos_start,
                     coef_callback(current_model.model.coef_)
                 except AttributeError:
                     print("Warning: Model does not have .model.coef_ attribute for callback.")
+        else:
+            X_model = X_current
+            if impute_strategy is not None:
+                fill_values = _fit_window_imputer(
+                    X_current.iloc[: t - gap],
+                    strategy=impute_strategy,
+                    all_missing_fill_value=all_missing_fill_value,
+                )
+                preserve_mask = (
+                    _availability_timing_mask(X_current)
+                    if preserve_availability_timing else None
+                )
+                X_model = _apply_window_imputer(X_current, fill_values, preserve_mask=preserve_mask)
+            if drop_unavailable_columns and selected_columns is not None:
+                X_model = _apply_column_selection(X_model, selected_columns)
+            if carry_forward_latest:
+                X_model = _carry_forward_latest(X_model)
 
         # Use sequence architectures' own prediction method if available
         if hasattr(model, "predict_at"):
-            pred = model.predict_at(X_current, t)
+            pred = model.predict_at(X_model, t)
         else:
-            pred = model.predict(X_current.iloc[[t]])
+            pred = model.predict(X_model.iloc[[t]])
 
         if y.ndim == 1:
             y_forecast[t] = pred[-1] if isinstance(pred, np.ndarray) else pred
