@@ -4,16 +4,122 @@ import utils.window_utils as wu
 import numpy as np
 import torch
 
-def compute_top_k_ensemble(forecasts_array: np.ndarray, val_losses_array: np.ndarray, k: int):
-    # Same ensembling logic as existing notebook code: top-k per maturity and date by val loss.
+def _nanmean_with_counts(arr, axis):
+    """NaN-safe mean and valid-count helper for selection statistics."""
+    valid_counts = np.sum(~np.isnan(arr), axis=axis)
+    sums = np.nansum(arr, axis=axis)
+    means = np.divide(
+        sums,
+        valid_counts,
+        out=np.full(np.shape(sums), np.nan, dtype=float),
+        where=valid_counts > 0,
+    )
+    return means, valid_counts
+
+
+def compute_top_k_ensemble(
+    forecasts_array: np.ndarray,
+    val_losses_array: np.ndarray,
+    k: int,
+    selection_mode: str = "per_maturity",
+    selection_metric: str = "val_loss",
+    y_true: np.ndarray | None = None,
+    lookback: int = 120,
+    min_history: int = 24,
+    realization_lag: int = 0,
+):
+    """Compute a top-k ensemble from seed forecasts.
+
+    ``selection_metric='val_loss'`` reproduces the original validation-loss selector.
+    ``selection_metric='trailing_oos'`` ranks seeds by trailing realized OOS MSE using
+    only outcomes available at forecast time, then falls back to validation loss when
+    realized history is too short.
+    """
+    if selection_mode not in {"per_maturity", "total"}:
+        raise ValueError("selection_mode must be either 'per_maturity' or 'total'.")
+    if selection_metric not in {"val_loss", "trailing_oos"}:
+        raise ValueError("selection_metric must be either 'val_loss' or 'trailing_oos'.")
+
     T, n_seeds, n_outputs = forecasts_array.shape
     ensemble_forecast = np.full((T, n_outputs), np.nan)
     topk_indices = np.full((T, n_outputs, min(k, n_seeds)), -1, dtype=int)
 
+    if selection_metric == "trailing_oos":
+        if y_true is None:
+            raise ValueError("y_true must be provided when selection_metric='trailing_oos'.")
+        y_true = np.asarray(y_true)
+        if y_true.ndim == 1:
+            y_true = y_true.reshape(-1, 1)
+        if y_true.shape != (T, n_outputs):
+            raise ValueError(f"y_true must have shape {(T, n_outputs)}; got {y_true.shape}.")
+
+    def _select_total_from_val_losses(t):
+        seed_losses, seed_valid_counts = _nanmean_with_counts(val_losses_array[t], axis=1)
+        valid_idx = np.where((~np.isnan(seed_losses)) & (seed_valid_counts > 0))[0]
+        return seed_losses, valid_idx
+
+    def _select_per_maturity_from_val_losses(t, m):
+        v_losses = val_losses_array[t, :, m]
+        valid_idx = np.where(~np.isnan(v_losses))[0]
+        return v_losses, valid_idx
+
     for t in range(T):
+        if selection_mode == "total":
+            use_val_fallback = True
+            if selection_metric == "trailing_oos":
+                hist_end = t - realization_lag
+                hist_start = max(0, hist_end - lookback)
+                if hist_end > hist_start:
+                    trailing_err = (
+                        forecasts_array[hist_start:hist_end]
+                        - y_true[hist_start:hist_end, None, :]
+                    ) ** 2
+                    seed_losses, seed_valid_counts = _nanmean_with_counts(
+                        trailing_err,
+                        axis=(0, 2),
+                    )
+                    valid_idx = np.where(
+                        (~np.isnan(seed_losses)) & (seed_valid_counts >= min_history)
+                    )[0]
+                    use_val_fallback = len(valid_idx) == 0
+
+            if use_val_fallback:
+                seed_losses, valid_idx = _select_total_from_val_losses(t)
+            if len(valid_idx) == 0:
+                continue
+            actual_k = min(k, len(valid_idx))
+            sorted_valid_idx = valid_idx[np.argsort(seed_losses[valid_idx])]
+            selected = sorted_valid_idx[:actual_k]
+
+            topk_indices[t, :, :actual_k] = selected[None, :]
+            ensemble_forecast[t], _ = _nanmean_with_counts(forecasts_array[t, selected, :], axis=0)
+            continue
+
+        trailing_seed_losses = None
+        trailing_seed_counts = None
+        if selection_metric == "trailing_oos":
+            hist_end = t - realization_lag
+            hist_start = max(0, hist_end - lookback)
+            if hist_end > hist_start:
+                trailing_err = (
+                    forecasts_array[hist_start:hist_end]
+                    - y_true[hist_start:hist_end, None, :]
+                ) ** 2
+                trailing_seed_losses, trailing_seed_counts = _nanmean_with_counts(
+                    trailing_err,
+                    axis=0,
+                )
+
         for m in range(n_outputs):
-            v_losses = val_losses_array[t, :, m]
-            valid_idx = np.where(~np.isnan(v_losses))[0]
+            use_val_fallback = True
+            if selection_metric == "trailing_oos" and trailing_seed_losses is not None:
+                v_losses = trailing_seed_losses[:, m]
+                counts = trailing_seed_counts[:, m]
+                valid_idx = np.where((~np.isnan(v_losses)) & (counts >= min_history))[0]
+                use_val_fallback = len(valid_idx) == 0
+
+            if use_val_fallback:
+                v_losses, valid_idx = _select_per_maturity_from_val_losses(t, m)
             if len(valid_idx) == 0:
                 continue
 
@@ -22,7 +128,7 @@ def compute_top_k_ensemble(forecasts_array: np.ndarray, val_losses_array: np.nda
             selected = sorted_valid_idx[:actual_k]
 
             topk_indices[t, m, :actual_k] = selected
-            ensemble_forecast[t, m] = np.mean(forecasts_array[t, selected, m], axis=0)
+            ensemble_forecast[t, m], _ = _nanmean_with_counts(forecasts_array[t, selected, m], axis=0)
 
     return ensemble_forecast, topk_indices
 
@@ -80,6 +186,11 @@ class RunConfig:
     progress: bool = False
     save_checkpoints: bool = True
     artifacts_root: Path = Path('../artifacts/orchestrator_runs')
+    ensemble_metrics: tuple[str, ...] = ("val_loss", "trailing_oos")
+    ensemble_selection_mode: str = "per_maturity"
+    trailing_lookback: int = 120
+    trailing_min_history: int = 24
+    trailing_realization_lag: int | None = None
 
 
 def _save_checkpoint(wrapper, seed: int, t_index: int, date_value, run_dir: Path) -> Path:
@@ -157,23 +268,51 @@ def run_experiment(cfg: RunConfig, X: pd.DataFrame, y_all: np.ndarray, dates: pd
     forecasts_arr = np.stack(all_forecasts, axis=1)
     losses_arr = np.stack(all_val_losses, axis=1)
 
-    ensemble_forecast, topk_indices = compute_top_k_ensemble(forecasts_arr, losses_arr, cfg.k_top)
+    ensemble_outputs = {}
+    performance_rows = []
+    realization_lag = cfg.gap if cfg.trailing_realization_lag is None else cfg.trailing_realization_lag
 
-    r2s = wu.oos_r2(y_all, ensemble_forecast, benchmark=cfg.benchmark)
-    pvals = np.array([bu.RSZ_Signif(y_all[:, i], ensemble_forecast[:, i])
-                     for i in range(n_outputs)])
+    for metric in cfg.ensemble_metrics:
+        ensemble_forecast, topk_indices = compute_top_k_ensemble(
+            forecasts_arr,
+            losses_arr,
+            cfg.k_top,
+            selection_mode=cfg.ensemble_selection_mode,
+            selection_metric=metric,
+            y_true=y_all,
+            lookback=cfg.trailing_lookback,
+            min_history=cfg.trailing_min_history,
+            realization_lag=realization_lag,
+        )
+        ensemble_outputs[metric] = (ensemble_forecast, topk_indices)
 
-    performance_tuples = list(zip(cfg.maturities, r2s.tolist(), pvals.tolist()))
+        r2s = wu.oos_r2(y_all, ensemble_forecast, benchmark=cfg.benchmark, gap=cfg.gap)
+        pvals = np.array([
+            bu.RSZ_Signif(y_all[:, i], ensemble_forecast[:, i], gap=cfg.gap)
+            for i in range(n_outputs)
+        ])
+        for maturity, r2, pval in zip(cfg.maturities, r2s.tolist(), pvals.tolist()):
+            performance_rows.append({
+                "ensemble_method": metric,
+                "selection_mode": cfg.ensemble_selection_mode,
+                "maturity": maturity,
+                "r2_oos": r2,
+                "rsz_pval": pval,
+            })
 
     # Persist arrays and metadata
     np.save(run_dir / 'forecasts_arr.npy', forecasts_arr)
     np.save(run_dir / 'losses_arr.npy', losses_arr)
-    np.save(run_dir / 'ensemble_forecast.npy', ensemble_forecast)
-    np.save(run_dir / 'topk_indices.npy', topk_indices)
+    for metric, (ensemble_forecast, topk_indices) in ensemble_outputs.items():
+        suffix = "" if metric == "val_loss" else f"_{metric}"
+        np.save(run_dir / f'ensemble_forecast{suffix}.npy', ensemble_forecast)
+        np.save(run_dir / f'topk_indices{suffix}.npy', topk_indices)
+        np.save(run_dir / f'ensemble_forecast_{metric}.npy', ensemble_forecast)
+        np.save(run_dir / f'topk_indices_{metric}.npy', topk_indices)
     if cfg.save_checkpoints:
         pd.DataFrame(ckpt_manifest).to_csv(run_dir / 'checkpoint_manifest.csv', index=False)
     
-    perf_df = pd.DataFrame(performance_tuples, columns=['maturity', 'r2_oos', 'rsz_pval'])
+    perf_df = pd.DataFrame(performance_rows)
     perf_df.to_csv(run_dir / 'performance.csv', index=False)
 
     serializable_cfg = asdict(cfg)
@@ -196,7 +335,7 @@ def run_experiment(cfg: RunConfig, X: pd.DataFrame, y_all: np.ndarray, dates: pd
         'num_checkpoints': num_checkpoints,
         'total_checkpoint_gb': total_checkpoint_gb,
         'save_checkpoints': cfg.save_checkpoints,
-        'performance': performance_tuples,
+        'performance': performance_rows,
         'forecasts_arr_shape': forecasts_arr.shape,
         'losses_arr_shape': losses_arr.shape,
     }

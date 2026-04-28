@@ -27,13 +27,21 @@ class EarlyStopping:
             if self.counter >= self.patience:
                 self.early_stop = True
 
+
+def _activation_layer(name):
+    if name == 'relu':
+        return nn.ReLU()
+    if name == 'tanh':
+        return nn.Tanh()
+    raise ValueError(f"Unsupported activation: {name}")
+
 class _GroupEnsembleMLPNetwork(nn.Module):
     """
     Constructs a group-ensemble feedforward architecture: 
     One tower for forward rates, and an independent tower for EACH macroeconomic group.
     All towers merge strictly at the output layer.
     """
-    def __init__(self, input_dim_fwd, macro_group_dims: dict, archi_fwd, archi_macro, output_dim, dropout_rate=0.0):
+    def __init__(self, input_dim_fwd, macro_group_dims: dict, archi_fwd, archi_macro, output_dim, dropout_rate=0.0, activation='relu'):
         super(_GroupEnsembleMLPNetwork, self).__init__()
        
         # 1. Forward rates tower (same as before)
@@ -41,7 +49,7 @@ class _GroupEnsembleMLPNetwork(nn.Module):
         current_dim = input_dim_fwd
         for i, hidden_dim in enumerate(archi_fwd):
             fwd_layers.append(nn.Linear(current_dim, hidden_dim))
-            fwd_layers.append(nn.ReLU())
+            fwd_layers.append(_activation_layer(activation))
             
             if i == len(archi_fwd) - 1:
                 fwd_layers.append(nn.BatchNorm1d(hidden_dim))
@@ -58,7 +66,7 @@ class _GroupEnsembleMLPNetwork(nn.Module):
             current_dim = input_dim_group
             for i, hidden_dim in enumerate(archi_macro):
                 group_layers.append(nn.Linear(current_dim, hidden_dim))
-                group_layers.append(nn.ReLU())
+                group_layers.append(_activation_layer(activation))
 
                 if dropout_rate > 0:
                     group_layers.append(nn.Dropout(dropout_rate))
@@ -99,7 +107,7 @@ class GroupEnsembleANNWrapper:
     """
     def __init__(self, archi_forward=(3,), archi_macro=(16, 8), lr=0.01, epochs=100, warm_start=False,
                  seed=42, momentum=0.9, param_grid=None, tune_every=60, patience=10,
-                 y_center=True):
+                 y_center=True, activation='relu'):
         self.archi_forward = archi_forward
         self.archi_macro = archi_macro
         self.lr = lr
@@ -114,6 +122,7 @@ class GroupEnsembleANNWrapper:
         self.tune_every = tune_every
         self.patience = patience
         self.y_center = y_center
+        self.activation = activation
        
         # Internal state
         self.model = None
@@ -233,7 +242,8 @@ class GroupEnsembleANNWrapper:
                         archi_fwd=self.archi_forward,
                         archi_macro=self.archi_macro,
                         output_dim=output_dim,
-                        dropout_rate=dropout_rate
+                        dropout_rate=dropout_rate,
+                        activation=self.activation,
                     )
                     # temp_optimizer = optim.SGD(
                     #     temp_model.parameters(), lr=self.lr, momentum=self.momentum,
@@ -296,7 +306,8 @@ class GroupEnsembleANNWrapper:
                 archi_fwd=self.archi_forward,
                 archi_macro=self.archi_macro,
                 output_dim=output_dim,
-                dropout_rate=current_dropout_rate
+                dropout_rate=current_dropout_rate,
+                activation=self.activation,
             )
             # self.optimizer = optim.SGD(
             #     self.model.parameters(),

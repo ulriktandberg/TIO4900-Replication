@@ -410,6 +410,7 @@ class XGBoostModel(_BaseGBTModel):
         reg_alpha=0.0,
         reg_lambda=1.0,
         random_state=42,
+        n_jobs=None,
         arch_grid=None,
         tune_every=60,
         impute_strategy=None,
@@ -433,6 +434,8 @@ class XGBoostModel(_BaseGBTModel):
             "random_state": random_state,
             "objective": "reg:squarederror",
         }
+        if n_jobs is not None:
+            self.fixed_params["n_jobs"] = n_jobs
 
 
 class LightGBMModel(_BaseGBTModel):
