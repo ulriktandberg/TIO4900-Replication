@@ -26,13 +26,21 @@ class EarlyStopping:
             self.counter += 1
             if self.counter >= self.patience:
                 self.early_stop = True
+
+
+def _activation_layer(name):
+    if name == 'relu':
+        return nn.ReLU()
+    if name == 'tanh':
+        return nn.Tanh()
+    raise ValueError(f"Unsupported activation: {name}")
  
 class _TwoTowerMLPNetwork(nn.Module):
     """
     Constructs a two-tower feedforward architecture: one for forward rates, one for macro/fred variables.
     Towers merge before the output layer. The macro tower includes dropout regularization.
     """
-    def __init__(self, input_dim_fwd, input_dim_fred, archi_fwd, archi_fred, output_dim, dropout_rate=0.0):
+    def __init__(self, input_dim_fwd, input_dim_fred, archi_fwd, archi_fred, output_dim, dropout_rate=0.0, activation='relu'):
         super(_TwoTowerMLPNetwork, self).__init__()
        
         # Forward rates tower
@@ -40,7 +48,7 @@ class _TwoTowerMLPNetwork(nn.Module):
         current_dim = input_dim_fwd
         for i, hidden_dim in enumerate(archi_fwd):
             fwd_layers.append(nn.Linear(current_dim, hidden_dim))
-            fwd_layers.append(nn.ReLU())
+            fwd_layers.append(_activation_layer(activation))
             if i == len(archi_fwd) - 1:
                 fwd_layers.append(nn.BatchNorm1d(hidden_dim))
             current_dim = hidden_dim
@@ -52,7 +60,7 @@ class _TwoTowerMLPNetwork(nn.Module):
         current_dim = input_dim_fred
         for i, hidden_dim in enumerate(archi_fred):
             fred_layers.append(nn.Linear(current_dim, hidden_dim))
-            fred_layers.append(nn.ReLU())
+            fred_layers.append(_activation_layer(activation))
             if dropout_rate > 0:
                 fred_layers.append(nn.Dropout(dropout_rate))
             if i == len(archi_fred) - 1:
@@ -80,7 +88,7 @@ class MacroForwardANNWrapper:
     """
     def __init__(self, archi_forward=(3,), archi_macro=(16, 8), lr=0.01, epochs=100, warm_start=False,
                  seed=42, momentum=0.9, param_grid=None, tune_every=60, patience=10,
-                 y_center=True):
+                 y_center=True, activation='relu'):
         self.archi_forward = archi_forward
         self.archi_macro = archi_macro
         self.lr = lr
@@ -95,6 +103,7 @@ class MacroForwardANNWrapper:
         self.tune_every = tune_every
         self.patience = patience
         self.y_center = y_center
+        self.activation = activation
        
         # Internal state
         self.model = None
@@ -202,7 +211,8 @@ class MacroForwardANNWrapper:
                         archi_fwd=self.archi_forward,
                         archi_fred=self.archi_macro,
                         output_dim=output_dim,
-                        dropout_rate=dropout_rate
+                        dropout_rate=dropout_rate,
+                        activation=self.activation,
                     )
                     # temp_optimizer = optim.SGD(
                     #     temp_model.parameters(), lr=self.lr, momentum=self.momentum,
@@ -265,7 +275,8 @@ class MacroForwardANNWrapper:
                 archi_fwd=self.archi_forward,
                 archi_fred=self.archi_macro,
                 output_dim=output_dim,
-                dropout_rate=current_dropout_rate
+                dropout_rate=current_dropout_rate,
+                activation=self.activation,
             )
             # self.optimizer = optim.SGD(
             #     self.model.parameters(),
