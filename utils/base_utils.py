@@ -474,14 +474,15 @@ def plot_cssed(y_true, y_forecast, dates, oos_start, secondary_start=None, model
     plt.tight_layout()
     plt.show()
 
-def RSZ_Signif(y_true, y_forecast):
+def RSZ_Signif(y_true, y_forecast, gap=0, maxlags=12):
     # Copied from the replication code of Bianchi et al. (2021):
-    # Compute conidtional mean forecast
-    y_condmean = np.divide(y_true.cumsum(), (np.arange(y_true.size)+1))
-
-    # lag by one period
-    y_condmean = np.insert(y_condmean, 0, np.nan)
-    y_condmean = y_condmean[:-1]
+    # Compute conditional mean forecast using only returns available at forecast time.
+    y_condmean = np.full(y_true.size, np.nan)
+    for t in range(1, y_true.size):
+        end = t - gap if gap > 0 else t
+        if end < 1:
+            continue
+        y_condmean[t] = np.nanmean(y_true[:end])
     y_condmean[np.isnan(y_forecast)] = np.nan
 
     # Compute f-measure
@@ -491,6 +492,6 @@ def RSZ_Signif(y_true, y_forecast):
     # Regress f on a constant
     x = np.ones(np.shape(f))
     model = sm.OLS(f, x, missing='drop', hasconst=True)
-    results = model.fit(cov_type='HAC', cov_kwds={'maxlags': 12})
+    results = model.fit(cov_type='HAC', cov_kwds={'maxlags': maxlags})
 
     return 1-tstat.cdf(results.tvalues[0], results.nobs-1)

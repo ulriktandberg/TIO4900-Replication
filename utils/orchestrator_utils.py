@@ -268,6 +268,11 @@ def run_experiment(cfg: RunConfig, X: pd.DataFrame, y_all: np.ndarray, dates: pd
     forecasts_arr = np.stack(all_forecasts, axis=1)
     losses_arr = np.stack(all_val_losses, axis=1)
 
+    # Persist raw seed outputs before summary statistics so a reporting failure
+    # cannot discard an expensive HPC training run.
+    np.save(run_dir / 'forecasts_arr.npy', forecasts_arr)
+    np.save(run_dir / 'losses_arr.npy', losses_arr)
+
     ensemble_outputs = {}
     performance_rows = []
     realization_lag = cfg.gap if cfg.trailing_realization_lag is None else cfg.trailing_realization_lag
@@ -287,11 +292,13 @@ def run_experiment(cfg: RunConfig, X: pd.DataFrame, y_all: np.ndarray, dates: pd
         ensemble_outputs[metric] = (ensemble_forecast, topk_indices)
 
         r2s = wu.oos_r2(y_all, ensemble_forecast, benchmark=cfg.benchmark, gap=cfg.gap)
-        pvals = np.array([
-            bu.RSZ_Signif(y_all[:, i], ensemble_forecast[:, i], gap=cfg.gap)
-            for i in range(n_outputs)
-        ])
-        for maturity, r2, pval in zip(cfg.maturities, r2s.tolist(), pvals.tolist()):
+        pvals = []
+        for i in range(n_outputs):
+            try:
+                pvals.append(bu.RSZ_Signif(y_all[:, i], ensemble_forecast[:, i], gap=cfg.gap))
+            except Exception:
+                pvals.append(np.nan)
+        for maturity, r2, pval in zip(cfg.maturities, r2s.tolist(), pvals):
             performance_rows.append({
                 "ensemble_method": metric,
                 "selection_mode": cfg.ensemble_selection_mode,
@@ -300,9 +307,7 @@ def run_experiment(cfg: RunConfig, X: pd.DataFrame, y_all: np.ndarray, dates: pd
                 "rsz_pval": pval,
             })
 
-    # Persist arrays and metadata
-    np.save(run_dir / 'forecasts_arr.npy', forecasts_arr)
-    np.save(run_dir / 'losses_arr.npy', losses_arr)
+    # Persist ensembles and metadata.
     for metric, (ensemble_forecast, topk_indices) in ensemble_outputs.items():
         suffix = "" if metric == "val_loss" else f"_{metric}"
         np.save(run_dir / f'ensemble_forecast{suffix}.npy', ensemble_forecast)
