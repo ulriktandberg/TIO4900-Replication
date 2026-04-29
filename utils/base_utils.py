@@ -474,14 +474,17 @@ def plot_cssed(y_true, y_forecast, dates, oos_start, secondary_start=None, model
     plt.tight_layout()
     plt.show()
 
-def RSZ_Signif(y_true, y_forecast):
-    # Copied from the replication code of Bianchi et al. (2021):
-    # Compute conidtional mean forecast
-    y_condmean = np.divide(y_true.cumsum(), (np.arange(y_true.size)+1))
+def RSZ_Signif(y_true, y_forecast, gap=0):
+    # Copied from the replication code of Bianchi et al. (2021), adapted so
+    # the conditional-mean benchmark uses the same information set as the
+    # OOS forecast under the chosen gap.
+    y_condmean = np.full_like(y_true, np.nan, dtype=float)
+    for t in range(1, len(y_true)):
+        end = t - gap if gap > 0 else t
+        if end < 1:
+            continue
+        y_condmean[t] = np.mean(y_true[:end])
 
-    # lag by one period
-    y_condmean = np.insert(y_condmean, 0, np.nan)
-    y_condmean = y_condmean[:-1]
     y_condmean[np.isnan(y_forecast)] = np.nan
 
     # Compute f-measure
