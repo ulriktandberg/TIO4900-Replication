@@ -12,3 +12,5 @@ ipykernel
 requests
 openpyxl
 statsmodels
+shap
+pyarrow
