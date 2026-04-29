@@ -4,6 +4,14 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from sklearn.preprocessing import StandardScaler
+
+def _activation_layer(name: str) -> nn.Module:
+    key = str(name).strip().lower()
+    if key == "relu":
+        return nn.ReLU()
+    if key == "tanh":
+        return nn.Tanh()
+    raise ValueError("activation must be either 'relu' or 'tanh'")
  
 class EarlyStopping:
     """
@@ -26,21 +34,13 @@ class EarlyStopping:
             self.counter += 1
             if self.counter >= self.patience:
                 self.early_stop = True
-
-
-def _activation_layer(name):
-    if name == 'relu':
-        return nn.ReLU()
-    if name == 'tanh':
-        return nn.Tanh()
-    raise ValueError(f"Unsupported activation: {name}")
  
 class _TwoTowerMLPNetwork(nn.Module):
     """
     Constructs a two-tower feedforward architecture: one for forward rates, one for macro/fred variables.
     Towers merge before the output layer. The macro tower includes dropout regularization.
     """
-    def __init__(self, input_dim_fwd, input_dim_fred, archi_fwd, archi_fred, output_dim, dropout_rate=0.0, activation='relu'):
+    def __init__(self, input_dim_fwd, input_dim_fred, archi_fwd, archi_fred, output_dim, dropout_rate=0.0, activation="tanh"):
         super(_TwoTowerMLPNetwork, self).__init__()
        
         # Forward rates tower
@@ -88,7 +88,7 @@ class MacroForwardANNWrapper:
     """
     def __init__(self, archi_forward=(3,), archi_macro=(16, 8), lr=0.01, epochs=100, warm_start=False,
                  seed=42, momentum=0.9, param_grid=None, tune_every=60, patience=10,
-                 y_center=True, activation='relu'):
+                 y_center=True, activation="relu"):
         self.archi_forward = archi_forward
         self.archi_macro = archi_macro
         self.lr = lr

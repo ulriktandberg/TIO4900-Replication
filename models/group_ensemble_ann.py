@@ -4,6 +4,15 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from sklearn.preprocessing import StandardScaler
+
+
+def _activation_layer(name: str) -> nn.Module:
+    key = str(name).strip().lower()
+    if key == "relu":
+        return nn.ReLU()
+    if key == "tanh":
+        return nn.Tanh()
+    raise ValueError("activation must be either 'relu' or 'tanh'")
  
 class EarlyStopping:
     """
@@ -27,21 +36,13 @@ class EarlyStopping:
             if self.counter >= self.patience:
                 self.early_stop = True
 
-
-def _activation_layer(name):
-    if name == 'relu':
-        return nn.ReLU()
-    if name == 'tanh':
-        return nn.Tanh()
-    raise ValueError(f"Unsupported activation: {name}")
-
 class _GroupEnsembleMLPNetwork(nn.Module):
     """
     Constructs a group-ensemble feedforward architecture: 
     One tower for forward rates, and an independent tower for EACH macroeconomic group.
     All towers merge strictly at the output layer.
     """
-    def __init__(self, input_dim_fwd, macro_group_dims: dict, archi_fwd, archi_macro, output_dim, dropout_rate=0.0, activation='relu'):
+    def __init__(self, input_dim_fwd, macro_group_dims: dict, archi_fwd, archi_macro, output_dim, dropout_rate=0.0, activation="tanh"):
         super(_GroupEnsembleMLPNetwork, self).__init__()
        
         # 1. Forward rates tower (same as before)
@@ -104,10 +105,17 @@ class GroupEnsembleANNWrapper:
     """
     A scikit-learn style wrapper for the PyTorch group-ensemble MLP.
     Accepts X with MultiIndex ('forward', 'fred') and trains separate towers with separate scalers.
+    
+    Parameters:
+        batch_size: int or None
+            If None (default), uses full-batch gradient descent.
+            If int > 0, uses minibatch SGD with specified batch size.
+            Note: When switching from full-batch to minibatch, you typically need to
+            retune lr and weight_decay, as the number of optimizer steps changes dramatically.
     """
     def __init__(self, archi_forward=(3,), archi_macro=(16, 8), lr=0.01, epochs=100, warm_start=False,
                  seed=42, momentum=0.9, param_grid=None, tune_every=60, patience=10,
-                 y_center=True, activation='relu'):
+                 y_center=True, activation="relu", batch_size=None):
         self.archi_forward = archi_forward
         self.archi_macro = archi_macro
         self.lr = lr
@@ -115,20 +123,18 @@ class GroupEnsembleANNWrapper:
         self.warm_start = warm_start
         self.random_state = seed
         self.momentum = momentum
-        self.param_grid = param_grid if param_grid is not None else {
-            'penalty': [0.001, 0.0001],
-            'dropout_rate': [0.0, 0.1, 0.2]
-        }
+        self.param_grid = self._normalize_param_grid(param_grid)
         self.tune_every = tune_every
         self.patience = patience
         self.y_center = y_center
         self.activation = activation
+        self.batch_size = batch_size if batch_size is None or batch_size > 0 else None
        
         # Internal state
         self.model = None
         self.optimizer = None
-        self.criterion = nn.MSELoss()
-        self.val_criterion = nn.MSELoss(reduction='none')
+        self.criterion = nn.L1Loss()
+        self.val_criterion = nn.L1Loss(reduction='none')
         self.best_params_ = None
         self._fit_calls = 0
         self.val_loss_ = None
@@ -137,6 +143,36 @@ class GroupEnsembleANNWrapper:
         self.x_scaler_forward = None
         self.x_scalers_macro = {}
         self.y_scaler = None
+
+    def _normalize_param_grid(self, param_grid):
+        """
+        Build a stable hyperparameter grid with separate L2 and L1 terms.
+        Legacy support: if only 'penalty' is provided, map it to L2 and keep L1 at 0.
+        """
+        if param_grid is None:
+            return {
+                'l2_penalty': [0.001, 0.0001],
+                'l1_penalty': [0.0],
+                'dropout_rate': [0.0, 0.1, 0.2],
+            }
+
+        grid = dict(param_grid)
+
+        legacy_penalty = grid.pop('penalty', None)
+        if 'l2_penalty' not in grid:
+            grid['l2_penalty'] = legacy_penalty if legacy_penalty is not None else [0.001, 0.0001]
+        if 'l1_penalty' not in grid:
+            grid['l1_penalty'] = [0.0]
+        if 'dropout_rate' not in grid:
+            grid['dropout_rate'] = [0.0, 0.1, 0.2]
+
+        for key in ('l2_penalty', 'l1_penalty', 'dropout_rate'):
+            if not isinstance(grid[key], (list, tuple, np.ndarray)):
+                grid[key] = [grid[key]]
+            else:
+                grid[key] = list(grid[key])
+
+        return grid
  
     def _set_seed(self):
         if self.random_state is not None:
@@ -187,6 +223,23 @@ class GroupEnsembleANNWrapper:
             return True
         return (self._fit_calls % self.tune_every) == 0
  
+    def _create_minibatches(self, X_fwd_tensor, X_macro_tensors, y_tensor, batch_size):
+        """
+        Generator that yields mini-batches from the data.
+        Preserves temporal order (no shuffling) for time-series data.
+        """
+        n_samples = X_fwd_tensor.shape[0]
+        
+        for start_idx in range(0, n_samples, batch_size):
+            end_idx = min(start_idx + batch_size, n_samples)
+            batch_slice = slice(start_idx, end_idx)
+            
+            X_fwd_batch = X_fwd_tensor[batch_slice]
+            X_macro_batch = {grp: t[batch_slice] for grp, t in X_macro_tensors.items()}
+            y_batch = y_tensor[batch_slice]
+            
+            yield X_fwd_batch, X_macro_batch, y_batch
+ 
     def fit(self, X, y):
         """
         Fits the group-ensemble neural network.
@@ -229,71 +282,94 @@ class GroupEnsembleANNWrapper:
             y_subtrain, y_val = y_tensor[:split], y_tensor[split:]
            
             best_mse = float('inf')
-            best_penalty = self.param_grid['penalty'][0]
+            best_l2_penalty = self.param_grid['l2_penalty'][0]
+            best_l1_penalty = self.param_grid['l1_penalty'][0]
             best_dropout_rate = self.param_grid.get('dropout_rate', [0.0])[0]
             best_epochs = self.epochs
            
-            for penalty in self.param_grid['penalty']:
-                for dropout_rate in self.param_grid.get('dropout_rate', [0.0]):
-                    self._set_seed()
-                    temp_model = _GroupEnsembleMLPNetwork(
-                        input_dim_fwd=input_dim_fwd,
-                        macro_group_dims=macro_group_dims,
-                        archi_fwd=self.archi_forward,
-                        archi_macro=self.archi_macro,
-                        output_dim=output_dim,
-                        dropout_rate=dropout_rate,
-                        activation=self.activation,
-                    )
-                    # temp_optimizer = optim.SGD(
-                    #     temp_model.parameters(), lr=self.lr, momentum=self.momentum,
-                    #     nesterov=True, weight_decay=penalty
-                    # )
+            for l2_penalty in self.param_grid['l2_penalty']:
+                for l1_penalty in self.param_grid['l1_penalty']:
+                    for dropout_rate in self.param_grid.get('dropout_rate', [0.0]):
+                        self._set_seed()
+                        temp_model = _GroupEnsembleMLPNetwork(
+                            input_dim_fwd=input_dim_fwd,
+                            macro_group_dims=macro_group_dims,
+                            archi_fwd=self.archi_forward,
+                            archi_macro=self.archi_macro,
+                            output_dim=output_dim,
+                            dropout_rate=dropout_rate,
+                            activation=self.activation,
+                        )
 
-                    temp_optimizer = optim.Adam(
-                        temp_model.parameters(),
-                        lr=self.lr,
-                        weight_decay=penalty,
-                    )
-                   
-                    early_stopper = EarlyStopping(patience=self.patience)
-                   
-                    for epoch in range(self.epochs):
-                        temp_model.train()
-                        temp_optimizer.zero_grad()
-                        preds = temp_model(X_fwd_subtrain, X_macro_subtrain)
-                        loss = self.criterion(preds, y_subtrain)
-                        if penalty > 0:
-                            l1_penalty = sum(p.abs().sum() for p in temp_model.parameters())
-                            loss += penalty * l1_penalty
-                        loss.backward()
-                        temp_optimizer.step()
-                   
-                        # Early Stopping Check against validation set every epoch
-                        temp_model.eval()
-                        with torch.no_grad():
-                            val_preds = temp_model(X_fwd_val, X_macro_val)
-                            val_mse = self.criterion(val_preds, y_val).item()
-                           
-                        early_stopper(val_mse, epoch)
-                        if early_stopper.early_stop:
-                            break
+                        temp_optimizer = optim.Adam(
+                            temp_model.parameters(),
+                            lr=self.lr,
+                            weight_decay=l2_penalty,
+                        )
                        
-                    if early_stopper.best_loss < best_mse:
-                        best_mse = early_stopper.best_loss
-                        best_penalty = penalty
-                        best_dropout_rate = dropout_rate
-                        best_epochs = early_stopper.best_epoch + 1
+                        early_stopper = EarlyStopping(patience=self.patience)
+                       
+                        for epoch in range(self.epochs):
+                            temp_model.train()
+                            
+                            # Minibatch or full-batch training
+                            if self.batch_size is None:
+                                # Full-batch
+                                temp_optimizer.zero_grad()
+                                preds = temp_model(X_fwd_subtrain, X_macro_subtrain)
+                                loss = self.criterion(preds, y_subtrain)
+                                if l1_penalty > 0:
+                                    l1_norm = sum(p.abs().sum() for p in temp_model.parameters())
+                                    loss += l1_penalty * l1_norm
+                                loss.backward()
+                                temp_optimizer.step()
+                            else:
+                                # Minibatch
+                                for X_fwd_batch, X_macro_batch, y_batch in self._create_minibatches(
+                                    X_fwd_subtrain, X_macro_subtrain, y_subtrain, self.batch_size
+                                ):
+                                    temp_optimizer.zero_grad()
+                                    preds = temp_model(X_fwd_batch, X_macro_batch)
+                                    loss = self.criterion(preds, y_batch)
+                                    if l1_penalty > 0:
+                                        l1_norm = sum(p.abs().sum() for p in temp_model.parameters())
+                                        loss += l1_penalty * l1_norm
+                                    loss.backward()
+                                    temp_optimizer.step()
+                       
+                            # Early Stopping Check against validation set every epoch
+                            temp_model.eval()
+                            with torch.no_grad():
+                                val_preds = temp_model(X_fwd_val, X_macro_val)
+                                val_mse = self.criterion(val_preds, y_val).item()
+                               
+                            early_stopper(val_mse, epoch)
+                            if early_stopper.early_stop:
+                                break
+                           
+                        if early_stopper.best_loss < best_mse:
+                            best_mse = early_stopper.best_loss
+                            best_l2_penalty = l2_penalty
+                            best_l1_penalty = l1_penalty
+                            best_dropout_rate = dropout_rate
+                            best_epochs = early_stopper.best_epoch + 1
                    
-            self.best_params_ = {'penalty': best_penalty, 'dropout_rate': best_dropout_rate, 'epochs': best_epochs}
+            self.best_params_ = {
+                'l2_penalty': best_l2_penalty,
+                'l1_penalty': best_l1_penalty,
+                'dropout_rate': best_dropout_rate,
+                'epochs': best_epochs,
+            }
         elif self.best_params_ is None:
             self.best_params_ = {
-                'penalty': self.param_grid['penalty'][0],
+                'l2_penalty': self.param_grid['l2_penalty'][0],
+                'l1_penalty': self.param_grid['l1_penalty'][0],
                 'dropout_rate': self.param_grid.get('dropout_rate', [0.0])[0],
                 'epochs': self.epochs
             }
  
-        current_penalty = self.best_params_['penalty']
+        current_l2_penalty = self.best_params_['l2_penalty']
+        current_l1_penalty = self.best_params_['l1_penalty']
         current_dropout_rate = self.best_params_['dropout_rate']
         current_epochs = self.best_params_['epochs']
        
@@ -309,38 +385,49 @@ class GroupEnsembleANNWrapper:
                 dropout_rate=current_dropout_rate,
                 activation=self.activation,
             )
-            # self.optimizer = optim.SGD(
-            #     self.model.parameters(),
-            #     lr=self.lr,
-            #     momentum=self.momentum,
-            #     nesterov=True,
-            #     weight_decay=current_penalty
-            # )
-
             self.optimizer = optim.Adam(
                 self.model.parameters(),
                 lr=self.lr,
-                weight_decay=current_penalty,
+                weight_decay=current_l2_penalty,
             )
         else:
             # If using warm start, ensure the optimizer uses the current best penalty for L2 weight decay
             for param_group in self.optimizer.param_groups:
-                param_group['weight_decay'] = current_penalty
+                param_group['weight_decay'] = current_l2_penalty
  
         # 4. Training Loop on full dataset
         self.model.train()
         for epoch in range(current_epochs):
-            self.optimizer.zero_grad()
-            predictions = self.model(X_fwd_tensor, X_macro_tensors)
-            loss = self.criterion(predictions, y_tensor)
-           
-            # Application of L1 penalty using the tuned parameter
-            if current_penalty > 0:
-                l1_penalty = sum(p.abs().sum() for p in self.model.parameters())
-                loss += current_penalty * l1_penalty
-           
-            loss.backward()
-            self.optimizer.step()
+            # Minibatch or full-batch training
+            if self.batch_size is None:
+                # Full-batch
+                self.optimizer.zero_grad()
+                predictions = self.model(X_fwd_tensor, X_macro_tensors)
+                loss = self.criterion(predictions, y_tensor)
+               
+                # Apply a separate L1 coefficient while L2 is handled by optimizer weight decay.
+                if current_l1_penalty > 0:
+                    l1_norm = sum(p.abs().sum() for p in self.model.parameters())
+                    loss += current_l1_penalty * l1_norm
+               
+                loss.backward()
+                self.optimizer.step()
+            else:
+                # Minibatch
+                for X_fwd_batch, X_macro_batch, y_batch in self._create_minibatches(
+                    X_fwd_tensor, X_macro_tensors, y_tensor, self.batch_size
+                ):
+                    self.optimizer.zero_grad()
+                    predictions = self.model(X_fwd_batch, X_macro_batch)
+                    loss = self.criterion(predictions, y_batch)
+                   
+                    # Apply a separate L1 coefficient while L2 is handled by optimizer weight decay.
+                    if current_l1_penalty > 0:
+                        l1_norm = sum(p.abs().sum() for p in self.model.parameters())
+                        loss += current_l1_penalty * l1_norm
+                   
+                    loss.backward()
+                    self.optimizer.step()
             
         # --- Evaluate Validation Loss for Ensembling ---
         if split >= 10 and (n_samples - split) > 0:
