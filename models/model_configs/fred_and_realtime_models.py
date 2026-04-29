@@ -1,5 +1,6 @@
 
-models = [{
+models = [
+    {
     'run_name': 'revised_lw_1971_08_2018_12_group_ens_ann_fwd33_grp1_100runs_top10',
     'yield_type': 'lw',
     'start_date': '1971-08-31',
@@ -37,6 +38,7 @@ models = [{
     'tune_every': 60,
     'patience': 50,
     'param_grid': {'penalty': [1e-4, 1e-3, 1e-2, 0.1], 'dropout_rate': [0.0, 0.1, 0.3]},
+    'activation': 'tanh',
     'y_center': True,
     'n_models': 100,
     'k_top': 10,
@@ -45,7 +47,7 @@ models = [{
     'refit_freq': 1,
     'benchmark': 'hist_mean',
     'progress': True,
-    'save_checkpoints': False,
+    'save_checkpoints': True,
 },
 {
     'run_name': 'realtime_lw_1971_08_2018_12_group_ens_ann_fwd33_grp1_100runs_top10',
@@ -85,6 +87,7 @@ models = [{
     'tune_every': 60,
     'patience': 50,
     'param_grid': {'penalty': [1e-4, 1e-3, 1e-2, 0.1], 'dropout_rate': [0.0, 0.1, 0.3]},
+    'activation': 'tanh',
     'y_center': True,
     'n_models': 100,
     'k_top': 10,
@@ -133,6 +136,7 @@ models = [{
     'tune_every': 60,
     'patience': 50,
     'param_grid': {'penalty': [1e-4, 1e-3, 1e-2, 0.1], 'dropout_rate': [0.0, 0.1, 0.3]},
+    'activation': 'tanh',
     'y_center': True,
     'n_models': 100,
     'k_top': 10,
@@ -181,6 +185,7 @@ models = [{
     'tune_every': 60,
     'patience': 50,
     'param_grid': {'penalty': [1e-4, 1e-3, 1e-2, 0.1], 'dropout_rate': [0.0, 0.1, 0.3]},
+    'activation': 'tanh',
     'y_center': True,
     'n_models': 100,
     'k_top': 10,
@@ -189,6 +194,6 @@ models = [{
     'refit_freq': 1,
     'benchmark': 'hist_mean',
     'progress': True,
-    'save_checkpoints': False,
+    'save_checkpoints': True,
 },
 ]
