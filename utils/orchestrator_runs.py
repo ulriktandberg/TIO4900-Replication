@@ -8,9 +8,43 @@ from datetime import datetime
 from typing import Any, Callable
 
 from tqdm.auto import tqdm
+import os
 
 import utils.base_utils as bu
 import utils.window_utils as wu
+
+def load_and_reensemble_run(run_dir, k=10, saved_metric="val_loss"):
+    """Load checkpoint-derived seed forecasts and rebuild a top-k ensemble."""
+    run_dir = os.path.abspath(run_dir)
+    forecasts_path = os.path.join(run_dir, "forecasts_arr.npy")
+    losses_path = os.path.join(run_dir, "losses_arr.npy")
+    ensemble_path = os.path.join(run_dir, f"ensemble_forecast_{saved_metric}.npy")
+    topk_path = os.path.join(run_dir, f"topk_indices_{saved_metric}.npy")
+
+    if not os.path.exists(forecasts_path):
+        raise FileNotFoundError(f"Missing forecasts array: {forecasts_path}")
+    if not os.path.exists(losses_path):
+        raise FileNotFoundError(f"Missing losses array: {losses_path}")
+
+    forecasts_arr = np.load(forecasts_path)
+    losses_arr = np.load(losses_path)
+    rebuilt_ensemble, rebuilt_topk = compute_top_k_ensemble(forecasts_arr, losses_arr, k)
+
+    if (
+        k == 10
+        and saved_metric == "val_loss"
+        and os.path.exists(ensemble_path)
+        and os.path.exists(topk_path)
+    ):
+        saved_ensemble = np.load(ensemble_path)
+        saved_topk = np.load(topk_path)
+        if not np.allclose(rebuilt_ensemble, saved_ensemble, equal_nan=True):
+            raise ValueError(f"Rebuilt ensemble does not match {ensemble_path}")
+        if not np.array_equal(rebuilt_topk, saved_topk):
+            raise ValueError(f"Rebuilt top-k indices do not match {topk_path}")
+        return saved_ensemble, saved_topk, forecasts_arr, losses_arr
+
+    return rebuilt_ensemble, rebuilt_topk, forecasts_arr, losses_arr
 
 def compute_top_k_ensemble(forecasts_array: np.ndarray, val_losses_array: np.ndarray, k: int):
     # Same ensembling logic as existing notebook code: top-k per maturity and date by val loss.
@@ -161,8 +195,8 @@ def run_experiment(cfg: RunConfig, X: pd.DataFrame, y_all: np.ndarray, dates: pd
 
     ensemble_forecast, topk_indices = compute_top_k_ensemble(forecasts_arr, losses_arr, cfg.k_top)
 
-    r2s = wu.oos_r2(y_all, ensemble_forecast, benchmark=cfg.benchmark)
-    pvals = np.array([bu.RSZ_Signif(y_all[:, i], ensemble_forecast[:, i])
+    r2s = wu.oos_r2(y_all, ensemble_forecast, benchmark=cfg.benchmark, gap=cfg.gap)
+    pvals = np.array([bu.RSZ_Signif(y_all[:, i], ensemble_forecast[:, i], gap=cfg.gap)
                      for i in range(n_outputs)])
 
     performance_tuples = list(zip(cfg.maturities, r2s.tolist(), pvals.tolist()))

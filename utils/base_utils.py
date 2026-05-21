@@ -277,6 +277,51 @@ def get_forward_rates(yields: pd.DataFrame) -> pd.DataFrame:
     return forward_rates
 
 
+def get_monthly_forward_rates(yields: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calculate monthly forward rates from zero-coupon yields.
+    
+    f_t(n) = log P_t(n - 1/12) - log P_t(n)
+    
+    With monthly maturities m (in months):
+        log P_t(m) = -(m/12) * y_t(m)
+        f_t(m) = -(m-1)/12 * y_t(m-1) + m/12 * y_t(m)
+    
+    Forward rates are computed for yearly maturities 12, 24, ..., 120.
+    
+    Parameters:
+    -----------
+    yields : pd.DataFrame
+        Zero-coupon yields with monthly maturity columns (as strings: '1', '2', ..., '120')
+        
+    Returns:
+    --------
+    pd.DataFrame
+        Monthly forward rates for maturities 12, 24, ..., 120
+    """
+    # Maturities for which we compute forward rates (yearly maturities in months)
+    forward_maturities = [str(i) for i in range(12, 121) if i % 12 == 0]
+    
+    forward_rates = pd.DataFrame(index=yields.index)
+    
+    for m_str in forward_maturities:
+        m = int(m_str)
+        m_prev = m - 1  # maturity one month shorter
+        
+        # log P_t(m) = -(m/12) * y_t(m)
+        log_p_m = -(m / 12) * yields[m_str]
+        
+        if m_prev == 0:
+            log_p_m_prev = 0.0
+        else:
+            log_p_m_prev = -(m_prev / 12) * yields[str(m_prev)]
+        
+        # f_t(m) = log P_t(m-1) - log P_t(m)
+        forward_rates[m_str] = log_p_m_prev - log_p_m
+    
+    return forward_rates
+
+
 def get_fredmd_grouping():
     """
     Return (ordered_series, series_to_group) for the earlier FRED-MD style
@@ -478,6 +523,9 @@ def RSZ_Signif(y_true, y_forecast, gap=0):
     # Copied from the replication code of Bianchi et al. (2021), adapted so
     # the conditional-mean benchmark uses the same information set as the
     # OOS forecast under the chosen gap.
+    y_true = np.asarray(y_true, dtype=float).ravel()
+    y_forecast = np.asarray(y_forecast, dtype=float).ravel()
+
     y_condmean = np.full_like(y_true, np.nan, dtype=float)
     for t in range(1, len(y_true)):
         end = t - gap if gap > 0 else t
@@ -488,12 +536,13 @@ def RSZ_Signif(y_true, y_forecast, gap=0):
     y_condmean[np.isnan(y_forecast)] = np.nan
 
     # Compute f-measure
-    f = np.square(y_true-y_condmean)-np.square(y_true-y_forecast)  \
-        + np.square(y_condmean-y_forecast)
+    f = np.square(y_true - y_condmean) - np.square(y_true - y_forecast) + np.square(
+        y_condmean - y_forecast
+    )
 
     # Regress f on a constant
     x = np.ones(np.shape(f))
-    model = sm.OLS(f, x, missing='drop', hasconst=True)
-    results = model.fit(cov_type='HAC', cov_kwds={'maxlags': 12})
+    model = sm.OLS(f, x, missing="drop", hasconst=True)
+    results = model.fit(cov_type="HAC", cov_kwds={"maxlags": 12})
 
-    return 1-tstat.cdf(results.tvalues[0], results.nobs-1)
+    return 1 - tstat.cdf(results.tvalues[0], results.nobs - 1)

@@ -166,7 +166,8 @@ def shap_importance_for_snapshot(
         raise ValueError("Wrapper snapshot has no _model.")
 
     t_index = int(rec["t_index"])
-    train_end = t_index - gap
+    gap_i = int(gap)
+    train_end = max(t_index - gap_i, 0)
     if train_end <= 1:
         return pd.DataFrame()
 

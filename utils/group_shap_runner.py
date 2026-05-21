@@ -35,9 +35,10 @@ same background, just aggregated over different player sets.
 
 Output layout
 -------------
-Mirrors the DeepSHAP runner so downstream plotting can reuse conventions:
+Mirrors the DeepSHAP runner so downstream plotting can reuse conventions
+(including ``<run_ts>/<ensemble_metric>/`` when not legacy):
 
-    <output_root>/<run_name>/<run_ts>/
+    <output_root>/<run_name>/<run_ts>/[<ensemble_metric>/]
         group_shap_mean.parquet            columns: date, maturity, group, mean_shap, abs_mean_shap, n_seeds
         group_shap_per_seed.parquet        columns: date, maturity, seed, group, shap_value
         group_base_values.parquet          columns: date, maturity, base_value, ensemble_pred, n_seeds, additivity_residual
@@ -70,7 +71,13 @@ import torch
 from tqdm.auto import tqdm
 
 from .shap_adapters import get_adapter
-from .shap_runner import _reconstruct_ckpt_path
+from .shap_runner import (
+    _coerce_run_config_maturities,
+    _reconstruct_ckpt_path,
+    _resolve_ensemble_npy_paths,
+    _shap_output_base_dir,
+    expanding_window_train_end,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -111,6 +118,10 @@ class GroupShapRunConfig:
     unchanged (``group`` is ``forward`` or ``macro``). Point ``output_root``
     at e.g. ``artifacts/group_shap_binary`` so runs do not overwrite the
     nine-player artefacts."""
+
+    ensemble_metric: str | None = None
+    """Same as ``ShapRunConfig.ensemble_metric``: pick orchestrator
+    ``topk_indices_*.npy`` / ``ensemble_forecast_*.npy`` when legacy names are absent."""
 
 
 # --------------------------------------------------------------------------- #
@@ -505,8 +516,17 @@ def compute_group_shap_for_run(
     manifest["date"] = pd.to_datetime(manifest["date"])
     manifest = manifest.sort_values(["seed", "t_index"]).reset_index(drop=True)
 
-    topk_indices = np.load(run_dir / "topk_indices.npy")
-    ensemble_forecast = np.load(run_dir / "ensemble_forecast.npy")
+    topk_path, ens_path, ensemble_metric_used = _resolve_ensemble_npy_paths(
+        run_dir, cfg.ensemble_metric
+    )
+    logger.info(
+        "Using ensemble arrays metric=%s topk=%s ensemble=%s",
+        ensemble_metric_used,
+        topk_path.name,
+        ens_path.name,
+    )
+    topk_indices = np.load(topk_path)
+    ensemble_forecast = np.load(ens_path)
 
     # -- adapter + sample ckpt ----------------------------------------- #
     sample_row = manifest.iloc[0]
@@ -543,7 +563,7 @@ def compute_group_shap_for_run(
     W = _shapley_weight_matrix(n_players)
 
     # -- maturities / dates -------------------------------------------- #
-    all_mats = [str(m) for m in (run_config.get("maturities") or [])]
+    all_mats = _coerce_run_config_maturities(run_config, ensemble_forecast)
     mats = [str(m) for m in (cfg.maturities or all_mats)]
     missing = [m for m in mats if m not in all_mats]
     if missing:
@@ -562,7 +582,7 @@ def compute_group_shap_for_run(
     run_name = run_config.get("run_name", run_dir.parent.name)
     run_ts = run_dir.name
     out_root = Path(cfg.output_root).resolve()
-    out_dir = out_root / run_name / run_ts
+    out_dir = _shap_output_base_dir(out_root, run_name, run_ts, ensemble_metric_used)
     per_date_dir = out_dir / "per_date"
     if cfg.overwrite and out_dir.exists():
         import shutil
@@ -662,7 +682,7 @@ def compute_group_shap_for_run(
                 model = adapter.rebuild_model(ckpt, run_config).to(cfg.device)
 
                 gap = int(run_config.get("gap", 0))
-                train_end = max(refit_t - gap, 0)
+                train_end = expanding_window_train_end(refit_t, gap)
                 X_train = X.iloc[:train_end]
 
                 if cfg.binary_macro:
@@ -807,6 +827,9 @@ def compute_group_shap_for_run(
         "wrapper_class": wrapper_class,
         "players": list(canonical_players),
         "binary_macro": bool(cfg.binary_macro),
+        "ensemble_metric": ensemble_metric_used,
+        "orchestrator_topk_indices_path": str(topk_path),
+        "orchestrator_ensemble_forecast_path": str(ens_path),
         "n_players": int(n_players),
         "n_coalitions": int(n_coal),
         "maturities": mats,

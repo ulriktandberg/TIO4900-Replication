@@ -5,6 +5,15 @@ import torch.nn as nn
 import torch.optim as optim
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
+
+
+def _activation_layer(name: str) -> nn.Module:
+    key = str(name).strip().lower()
+    if key == "relu":
+        return nn.ReLU()
+    if key == "tanh":
+        return nn.Tanh()
+    raise ValueError("activation must be either 'relu' or 'tanh'")
  
 class EarlyStopping:
     """
@@ -32,7 +41,7 @@ class _MLPNetwork(nn.Module):
     """
     Constructs a simple feedforward architecture based on the `archi` tuple using forward rates only.
     """
-    def __init__(self, input_dim, archi, output_dim):
+    def __init__(self, input_dim, archi, output_dim, activation="relu"):
         super(_MLPNetwork, self).__init__()
        
         layers = []
@@ -41,7 +50,7 @@ class _MLPNetwork(nn.Module):
         # Build hidden layers
         for i, hidden_dim in enumerate(archi):
             layers.append(nn.Linear(current_dim, hidden_dim))
-            layers.append(nn.ReLU()) # Standard ReLU activation
+            layers.append(_activation_layer(activation))
 
             # Apply Batch Normalization to the activations after the last ReLU layer
             if i == len(archi) - 1:
@@ -65,7 +74,7 @@ class PyTorchMLPWrapper:
     """
     def __init__(self, archi=(3,), lr=0.01, epochs=100, warm_start=False,
                  seed=42, momentum=0.9, param_grid=None, tune_every=60, patience=10,
-                 use_pca=False, n_components=None, y_center=True):
+                 use_pca=False, n_components=None, y_center=True, activation="relu"):
         self.archi = archi
         self.lr = lr
         self.epochs = epochs
@@ -78,6 +87,7 @@ class PyTorchMLPWrapper:
         self.use_pca = use_pca
         self.n_components = n_components
         self.y_center = y_center
+        self.activation = activation
        
         # Internal state
         self.model = None
@@ -172,7 +182,12 @@ class PyTorchMLPWrapper:
            
             for penalty in self.param_grid['penalty']:
                 self._set_seed()
-                temp_model = _MLPNetwork(input_dim=input_dim, archi=self.archi, output_dim=output_dim)
+                temp_model = _MLPNetwork(
+                    input_dim=input_dim,
+                    archi=self.archi,
+                    output_dim=output_dim,
+                    activation=self.activation,
+                )
                 # temp_optimizer = optim.SGD(
                 #     temp_model.parameters(), lr=self.lr, momentum=self.momentum,
                 #     nesterov=True, weight_decay=penalty
@@ -222,7 +237,12 @@ class PyTorchMLPWrapper:
         # 3. Check if we need to initialize or re-initialize the model
         if self.model is None or not self.warm_start:
             self._set_seed()
-            self.model = _MLPNetwork(input_dim=input_dim, archi=self.archi, output_dim=output_dim)
+            self.model = _MLPNetwork(
+                input_dim=input_dim,
+                archi=self.archi,
+                output_dim=output_dim,
+                activation=self.activation,
+            )
            
             # self.optimizer = optim.SGD(
             #     self.model.parameters(),

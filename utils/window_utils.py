@@ -203,7 +203,10 @@ def expanding_window(model_class, X, y, dates, oos_start,
                 )
                 realtime_panel_cache[forecast_date] = realtime_panel
             X_current = _realtime_feature_frame(X, realtime_panel.transformed, t)
-
+            ####
+            # print(f"Time step {t} ({forecast_date.date()}): Realtime panel dimension: {realtime_panel.transformed.shape}")
+            # return(realtime_panel)
+            ####
         if i % refit_freq == 0:
             if model is None:
                 current_model = deepcopy(model_class)

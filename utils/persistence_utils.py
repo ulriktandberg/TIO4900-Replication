@@ -98,7 +98,7 @@ def run_expanding_multi_seed(
             tqdm_desc=f"seed {seed}",
             tqdm_leave=False
         )
-        r2 = wu.oos_r2(y, y_forecast, benchmark=benchmark)
+        r2 = wu.oos_r2(y, y_forecast, benchmark=benchmark, gap=gap)
         out[seed] = {"forecast": y_forecast, "r2": r2}
 
         # Persist forecast array so results can be reloaded without replaying

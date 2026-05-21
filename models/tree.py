@@ -100,8 +100,8 @@ class ForwardTreeEnsembleModel:
 
     def _make_estimator(self, params):
         if self.estimator == "ef":
-            return ExtraTreesRegressor(random_state=self.random_state, **params)
-        return RandomForestRegressor(random_state=self.random_state, **params)
+            return ExtraTreesRegressor(random_state=self.random_state, n_jobs=-1, **params)
+        return RandomForestRegressor(random_state=self.random_state, n_jobs=-1, **params)
 
     def _should_tune(self):
         if self.best_params_ is None:
@@ -403,24 +403,26 @@ class FwdFredTreeEnsemble1D:
         if self.estimator == "rf":
             return {
                 "n_estimators": [500, 1000],
-                "max_depth": [5, None],
-                "min_samples_leaf": [1],
-                "max_features": [1.0],
+                "max_depth": [5, 10, None],            
+                "min_samples_leaf": [1, 2, 5],     
+                "max_features": ["sqrt", 0.5, 1.0], 
             }
         if self.estimator == "ef":
             return {
                 "n_estimators": [500, 1000],
-                "max_depth": [5, None],
-                "min_samples_leaf": [1],
-                "max_features": [1.0],
+                "max_depth": [5, 10, None],            
+                "min_samples_leaf": [1, 2, 5],     
+                "max_features": ["sqrt", 0.5, 1.0], 
             }
         if self.estimator == "xgb":
             return {
-                "n_estimators": [200, 500],
+                "n_estimators": [500],
                 "max_depth": [3, 5],
                 "learning_rate": [0.03, 0.1],
                 "subsample": [0.8, 1.0],
                 "colsample_bytree": [0.6, 1.0],
+                "reg_alpha": [0, 0.1],
+                "reg_lambda": [0, 0.1],
             }
         # lgbm
         return {
@@ -431,6 +433,8 @@ class FwdFredTreeEnsemble1D:
             "min_child_samples": [20, 50],
             "subsample": [0.8, 1.0],
             "colsample_bytree": [0.6, 1.0],
+            "reg_alpha": [0, 0.1],
+            "reg_lambda": [0, 0.1],
         }
 
     def _extract_features(self, X):
@@ -461,14 +465,15 @@ class FwdFredTreeEnsemble1D:
 
     def _make_estimator(self, params):
         if self.estimator == "rf":
-            return RandomForestRegressor(random_state=self.random_state, **params)
+            return RandomForestRegressor(random_state=self.random_state, n_jobs=1, **params)
         if self.estimator == "ef":
-            return ExtraTreesRegressor(random_state=self.random_state, **params)
+            return ExtraTreesRegressor(random_state=self.random_state, n_jobs=1, **params)
         if self.estimator == "lgbm":
-            return LGBMRegressor(random_state=self.random_state, **params)
+            return LGBMRegressor(random_state=self.random_state, n_jobs=1, **params)
         return XGBRegressor(
             objective="reg:squarederror",
             random_state=self.random_state,
+            n_jobs=1,
             **params,
         )
 

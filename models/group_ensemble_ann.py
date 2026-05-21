@@ -133,8 +133,8 @@ class GroupEnsembleANNWrapper:
         # Internal state
         self.model = None
         self.optimizer = None
-        self.criterion = nn.L1Loss()
-        self.val_criterion = nn.L1Loss(reduction='none')
+        self.criterion = nn.MSELoss()
+        self.val_criterion = nn.MSELoss(reduction='none')
         self.best_params_ = None
         self._fit_calls = 0
         self.val_loss_ = None
@@ -148,29 +148,46 @@ class GroupEnsembleANNWrapper:
         """
         Build a stable hyperparameter grid with separate L2 and L1 terms.
         Legacy support: if only 'penalty' is provided, map it to L2 and keep L1 at 0.
+        Additionally, allow separate L2 penalties across the towers if specified.
         """
         if param_grid is None:
             return {
-                'l2_penalty': [0.001, 0.0001],
+                'l2_penalties': [(0.001, 0.001, 0.001), (0.0001, 0.0001, 0.0001)],
                 'l1_penalty': [0.0],
                 'dropout_rate': [0.0, 0.1, 0.2],
             }
 
         grid = dict(param_grid)
 
-        legacy_penalty = grid.pop('penalty', None)
-        if 'l2_penalty' not in grid:
-            grid['l2_penalty'] = legacy_penalty if legacy_penalty is not None else [0.001, 0.0001]
         if 'l1_penalty' not in grid:
             grid['l1_penalty'] = [0.0]
         if 'dropout_rate' not in grid:
             grid['dropout_rate'] = [0.0, 0.1, 0.2]
 
-        for key in ('l2_penalty', 'l1_penalty', 'dropout_rate'):
+        for key in ('l1_penalty', 'dropout_rate'):
             if not isinstance(grid[key], (list, tuple, np.ndarray)):
                 grid[key] = [grid[key]]
             else:
                 grid[key] = list(grid[key])
+
+        # Check for explicit separation first
+        has_separated = any(k in grid for k in ['l2_penalty_fwd', 'l2_penalty_macro', 'l2_penalty_top'])
+        if has_separated:
+            fwds = grid.get('l2_penalty_fwd', [0.001])
+            macros = grid.get('l2_penalty_macro', [0.001])
+            tops = grid.get('l2_penalty_top', [0.001])
+            
+            fwds = list(fwds) if isinstance(fwds, (list, tuple, np.ndarray)) else [fwds]
+            macros = list(macros) if isinstance(macros, (list, tuple, np.ndarray)) else [macros]
+            tops = list(tops) if isinstance(tops, (list, tuple, np.ndarray)) else [tops]
+            
+            import itertools
+            grid['l2_penalties'] = list(itertools.product(fwds, macros, tops))
+        else:
+            legacy_penalty = grid.pop('penalty', None)
+            l2_shared = grid.get('l2_penalty', legacy_penalty if legacy_penalty is not None else [0.001, 0.0001])
+            l2_shared = list(l2_shared) if isinstance(l2_shared, (list, tuple, np.ndarray)) else [l2_shared]
+            grid['l2_penalties'] = [(p, p, p) for p in l2_shared]
 
         return grid
  
@@ -282,12 +299,14 @@ class GroupEnsembleANNWrapper:
             y_subtrain, y_val = y_tensor[:split], y_tensor[split:]
            
             best_mse = float('inf')
-            best_l2_penalty = self.param_grid['l2_penalty'][0]
+            best_l2_fwd = self.param_grid['l2_penalties'][0][0]
+            best_l2_macro = self.param_grid['l2_penalties'][0][1]
+            best_l2_top = self.param_grid['l2_penalties'][0][2]
             best_l1_penalty = self.param_grid['l1_penalty'][0]
             best_dropout_rate = self.param_grid.get('dropout_rate', [0.0])[0]
             best_epochs = self.epochs
            
-            for l2_penalty in self.param_grid['l2_penalty']:
+            for (l2_fwd, l2_macro, l2_top) in self.param_grid['l2_penalties']:
                 for l1_penalty in self.param_grid['l1_penalty']:
                     for dropout_rate in self.param_grid.get('dropout_rate', [0.0]):
                         self._set_seed()
@@ -301,10 +320,15 @@ class GroupEnsembleANNWrapper:
                             activation=self.activation,
                         )
 
+                        param_groups = [
+                            {'params': temp_model.fwd_tower.parameters(), 'weight_decay': l2_fwd},
+                            {'params': temp_model.macro_towers.parameters(), 'weight_decay': l2_macro},
+                            {'params': list(temp_model.merge_bn.parameters()) + list(temp_model.output.parameters()), 'weight_decay': l2_top}
+                        ]
+
                         temp_optimizer = optim.Adam(
-                            temp_model.parameters(),
+                            param_groups,
                             lr=self.lr,
-                            weight_decay=l2_penalty,
                         )
                        
                         early_stopper = EarlyStopping(patience=self.patience)
@@ -349,26 +373,34 @@ class GroupEnsembleANNWrapper:
                            
                         if early_stopper.best_loss < best_mse:
                             best_mse = early_stopper.best_loss
-                            best_l2_penalty = l2_penalty
+                            best_l2_fwd = l2_fwd
+                            best_l2_macro = l2_macro
+                            best_l2_top = l2_top
                             best_l1_penalty = l1_penalty
                             best_dropout_rate = dropout_rate
                             best_epochs = early_stopper.best_epoch + 1
                    
             self.best_params_ = {
-                'l2_penalty': best_l2_penalty,
+                'l2_penalty_fwd': best_l2_fwd,
+                'l2_penalty_macro': best_l2_macro,
+                'l2_penalty_top': best_l2_top,
                 'l1_penalty': best_l1_penalty,
                 'dropout_rate': best_dropout_rate,
                 'epochs': best_epochs,
             }
         elif self.best_params_ is None:
             self.best_params_ = {
-                'l2_penalty': self.param_grid['l2_penalty'][0],
+                'l2_penalty_fwd': self.param_grid['l2_penalties'][0][0],
+                'l2_penalty_macro': self.param_grid['l2_penalties'][0][1],
+                'l2_penalty_top': self.param_grid['l2_penalties'][0][2],
                 'l1_penalty': self.param_grid['l1_penalty'][0],
                 'dropout_rate': self.param_grid.get('dropout_rate', [0.0])[0],
                 'epochs': self.epochs
             }
  
-        current_l2_penalty = self.best_params_['l2_penalty']
+        current_l2_fwd = self.best_params_['l2_penalty_fwd']
+        current_l2_macro = self.best_params_['l2_penalty_macro']
+        current_l2_top = self.best_params_['l2_penalty_top']
         current_l1_penalty = self.best_params_['l1_penalty']
         current_dropout_rate = self.best_params_['dropout_rate']
         current_epochs = self.best_params_['epochs']
@@ -385,15 +417,20 @@ class GroupEnsembleANNWrapper:
                 dropout_rate=current_dropout_rate,
                 activation=self.activation,
             )
+            param_groups = [
+                {'params': self.model.fwd_tower.parameters(), 'weight_decay': current_l2_fwd},
+                {'params': self.model.macro_towers.parameters(), 'weight_decay': current_l2_macro},
+                {'params': list(self.model.merge_bn.parameters()) + list(self.model.output.parameters()), 'weight_decay': current_l2_top}
+            ]
             self.optimizer = optim.Adam(
-                self.model.parameters(),
+                param_groups,
                 lr=self.lr,
-                weight_decay=current_l2_penalty,
             )
         else:
             # If using warm start, ensure the optimizer uses the current best penalty for L2 weight decay
-            for param_group in self.optimizer.param_groups:
-                param_group['weight_decay'] = current_l2_penalty
+            self.optimizer.param_groups[0]['weight_decay'] = current_l2_fwd
+            self.optimizer.param_groups[1]['weight_decay'] = current_l2_macro
+            self.optimizer.param_groups[2]['weight_decay'] = current_l2_top
  
         # 4. Training Loop on full dataset
         self.model.train()

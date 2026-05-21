@@ -47,23 +47,27 @@ class HistoricalMeanModel:
 
 
 class PCABaselineModel:
-    def __init__(self, components=3, series='yields'):
+    def __init__(self, components=3, series='yields', max_cols=None):
         self.components = components
         self.series = series
+        self.max_cols = None if max_cols is None else int(max_cols)
         self.pca = sklearn.decomposition.PCA(n_components=components)
         self.model = sklearn.linear_model.LinearRegression()
 
+    def _block(self, X):
+        data = X[self.series]
+        if self.max_cols is not None:
+            data = data.iloc[:, : self.max_cols]
+        return data
+
     def fit(self, X, y, X_val=None, y_val=None):
-        # perform PCA on yields:
-        yields = X[self.series]
-        # Fit the PCA on the TRAINING set
-        pca_scores = self.pca.fit_transform(yields)
-        
+        block = self._block(X)
+        pca_scores = self.pca.fit_transform(block)
         self.model.fit(pca_scores, y)
-    
+
     def predict(self, X):
-        yields = X[self.series]
-        pca_scores = self.pca.transform(yields)
+        block = self._block(X)
+        pca_scores = self.pca.transform(block)
         return self.model.predict(pca_scores)
 
 
@@ -472,78 +476,3 @@ class LudvigsonNgWithCPModel:
         return self.model.predict(features)
 
 
-
-import numpy as np
-import sklearn.decomposition
-import sklearn.linear_model
-import sklearn.preprocessing
-
-
-class MacroPCA8Model:
-    """
-    Panel A, model 1:
-    PCR using the first 8 PCs of the macro block.
-    """
-
-    def __init__(self, components=8, series='fred'):
-        self.components = components
-        self.series = series
-
-        self.scaler = sklearn.preprocessing.StandardScaler()
-        self.pca = sklearn.decomposition.PCA(n_components=components)
-        self.model = sklearn.linear_model.LinearRegression()
-
-    def fit(self, X, y, X_val=None, y_val=None):
-        macro = X[self.series]
-        macro_scaled = self.scaler.fit_transform(macro)
-        macro_pcs = self.pca.fit_transform(macro_scaled)
-        self.model.fit(macro_pcs, y)
-
-    def predict(self, X):
-        macro = X[self.series]
-        macro_scaled = self.scaler.transform(macro)
-        macro_pcs = self.pca.transform(macro_scaled)
-        return self.model.predict(macro_pcs)
-
-
-class LudvigsonNgModelNew:
-    """
-    Panel A, model 2:
-    Ludvigson-Ng specification:
-        F1, F1^3, F3, F4, F8
-    extracted from the first 8 macro PCs.
-    """
-
-    def __init__(self, series='fred', n_factors=8):
-        self.series = series
-        self.n_factors = max(n_factors, 8)
-
-        self.scaler = sklearn.preprocessing.StandardScaler()
-        self.pca = sklearn.decomposition.PCA(n_components=self.n_factors)
-        self.model = sklearn.linear_model.LinearRegression()
-
-    def fit(self, X, y, X_val=None, y_val=None):
-        macro = X[self.series]
-        macro_scaled = self.scaler.fit_transform(macro)
-        factors = self.pca.fit_transform(macro_scaled)
-
-        F1 = factors[:, [0]]
-        F3 = factors[:, [2]]
-        F4 = factors[:, [3]]
-        F8 = factors[:, [7]]
-
-        features = np.concatenate([F1, F1**3, F3, F4, F8], axis=1)
-        self.model.fit(features, y)
-
-    def predict(self, X):
-        macro = X[self.series]
-        macro_scaled = self.scaler.transform(macro)
-        factors = self.pca.transform(macro_scaled)
-
-        F1 = factors[:, [0]]
-        F3 = factors[:, [2]]
-        F4 = factors[:, [3]]
-        F8 = factors[:, [7]]
-
-        features = np.concatenate([F1, F1**3, F3, F4, F8], axis=1)
-        return self.model.predict(features)

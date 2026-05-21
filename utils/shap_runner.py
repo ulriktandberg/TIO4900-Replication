@@ -12,9 +12,26 @@ Typical use from a notebook::
     )
     summary = compute_shap_for_run(cfg, X=X, y_all=y_all, dates=dates)
 
-Output layout mirrors the orchestrator: ``artifacts/shap/<run_name>/<timestamp>/``.
+Output layout: ``artifacts/shap/<run_name>/<timestamp>/`` when the orchestrator
+uses legacy unsuffixed ``topk_indices.npy``; otherwise
+``artifacts/shap/<run_name>/<timestamp>/<ensemble_metric>/`` (e.g. ``val_loss``,
+``trailing_oos``) so different ensemble definitions never share files.
+
 Results are written incrementally per (date, maturity) batch so a long run can be
 resumed after interruption.
+
+For ``macro_variant: realtime`` orchestrator runs (or ``ShapRunConfig(realtime=True)``),
+macro rows are rebuilt like ``expanding_window(..., realtime=True)``: explanation
+inputs use vintage as of the target date; background samples use the vintage as
+of each seed's refit step. Match ``fred_md`` construction to training (no
+``shift(1)`` for realtime).
+
+**Training matrix parity:** Deep SHAP mirrors ``expanding_window`` refit
+preprocessing via ``_preprocess_X_like_expanding_window_refit`` in this module:
+columns still NaN anywhere on the training slice are dropped, then forward-fill
+is applied. Without that, saved scalers can see a different feature count than
+at train time (e.g. 9 vs 7 columns).
+
 """
 
 from __future__ import annotations
@@ -22,7 +39,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -35,9 +52,26 @@ from tqdm.auto import tqdm
 import shap  # type: ignore
 
 from .shap_adapters import get_adapter
+from .window_utils import (
+    _apply_column_selection,
+    _carry_forward_latest,
+    _realtime_feature_frame,
+    _select_train_available_columns,
+)
 
 
 logger = logging.getLogger(__name__)
+
+
+def _effective_realtime_flag(cfg_explicit: bool | None, run_config: dict) -> bool:
+    """Mirror ``expanding_window(..., realtime=True)`` runs.
+
+    When ``cfg.realtime is None``, enable realtime if ``run_config`` carries
+    ``macro_variant == "realtime"`` (orchestrator_ann / run_core_models JSON).
+    """
+    if cfg_explicit is not None:
+        return bool(cfg_explicit)
+    return str(run_config.get("macro_variant", "") or "").lower() == "realtime"
 
 
 # ---------------------------------------------------------------------------
@@ -90,10 +124,96 @@ class ShapRunConfig:
     additivity_residual) to ``per_seed_meta.parquet``. Tiny and useful — left on
     by default."""
 
+    realtime: bool | None = None
+    """If ``True``, rebuild macro features at each OOS date with
+    ``ForecastVintageMacroStore`` + ``_realtime_feature_frame`` (same as
+    ``expanding_window(..., realtime=True)``). If ``None``, use
+    ``run_config["macro_variant"] == "realtime"`` when present, else ``False``."""
+
+    realtime_store: Any | None = None
+    """Optional ``ForecastVintageMacroStore`` instance. If ``None`` and realtime
+    is active, a default store is constructed (same as ``expanding_window``)."""
+
+    ensemble_metric: str | None = None
+    """Which saved orchestrator ensemble to explain. Newer runs write
+    ``topk_indices_<metric>.npy`` / ``ensemble_forecast_<metric>.npy`` (e.g.
+    ``trailing_oos``, ``val_loss``) instead of legacy unsuffixed files.
+    If ``None``, prefer legacy ``topk_indices.npy``, then ``trailing_oos``, then
+    ``val_loss``, then any other ``topk_indices_*.npy`` pair on disk."""
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _resolve_ensemble_npy_paths(
+    run_dir: Path, ensemble_metric: str | None = None
+) -> tuple[Path, Path, str]:
+    """Return ``(topk_indices_path, ensemble_forecast_path, metric_label)``."""
+
+    run_dir = Path(run_dir)
+
+    def _pair_exists(topk_name: str, ens_name: str) -> tuple[Path, Path] | None:
+        pt = run_dir / topk_name
+        pe = run_dir / ens_name
+        if pt.is_file() and pe.is_file():
+            return pt, pe
+        return None
+
+    if ensemble_metric is not None:
+        m = str(ensemble_metric).strip()
+        if not m:
+            raise ValueError("ensemble_metric must be non-empty when set")
+        got = _pair_exists(f"topk_indices_{m}.npy", f"ensemble_forecast_{m}.npy")
+        if got:
+            return (*got, m)
+        raise FileNotFoundError(
+            f"Orchestrator run dir has no ensemble arrays for metric={m!r}: "
+            f"expected {run_dir / f'topk_indices_{m}.npy'} and "
+            f"{run_dir / f'ensemble_forecast_{m}.npy'}"
+        )
+
+    for label, tk_name, ef_name in (
+        ("legacy", "topk_indices.npy", "ensemble_forecast.npy"),
+        ("trailing_oos", "topk_indices_trailing_oos.npy", "ensemble_forecast_trailing_oos.npy"),
+        ("val_loss", "topk_indices_val_loss.npy", "ensemble_forecast_val_loss.npy"),
+    ):
+        got = _pair_exists(tk_name, ef_name)
+        if got:
+            return (*got, label)
+
+    for tk in sorted(run_dir.glob("topk_indices_*.npy")):
+        suffix = tk.stem.removeprefix("topk_indices_")
+        if not suffix:
+            continue
+        ef = run_dir / f"ensemble_forecast_{suffix}.npy"
+        got = _pair_exists(tk.name, ef.name)
+        if got:
+            return (*got, suffix)
+
+    raise FileNotFoundError(
+        f"No top-k / ensemble forecast .npy pair found under {run_dir}. "
+        "Expected legacy topk_indices.npy + ensemble_forecast.npy, or "
+        "topk_indices_<metric>.npy + ensemble_forecast_<metric>.npy "
+        "(e.g. trailing_oos, val_loss)."
+    )
+
+
+def _shap_output_base_dir(
+    output_root: Path, run_name: str, orchestrator_ts: str, ensemble_metric_used: str
+) -> Path:
+    """Directory for Deep SHAP parquet/metadata under ``output_root``.
+
+    Legacy orchestrator outputs (unsuffixed ``topk_indices.npy``) keep the old
+    flat layout ``.../<run_name>/<ts>/``. Any metric-specific ensemble arrays use
+    ``.../<run_name>/<ts>/<metric>/`` so ``val_loss`` vs ``trailing_oos`` cannot mix.
+    """
+
+    base = Path(output_root).resolve() / run_name / orchestrator_ts
+    if ensemble_metric_used != "legacy":
+        base = base / ensemble_metric_used
+    return base
 
 
 def _resolve_dates_selector(selector: Any, oos_dates: pd.DatetimeIndex) -> pd.DatetimeIndex:
@@ -125,6 +245,86 @@ def _resolve_dates_selector(selector: Any, oos_dates: pd.DatetimeIndex) -> pd.Da
 def _maturity_columns(run_config: dict) -> list[str]:
     mats = run_config.get("maturities") or []
     return [str(m) for m in mats]
+
+
+_DEFAULT_YEARLY_MATURITIES = ("24", "36", "48", "60", "84", "120")
+
+
+def _coerce_run_config_maturities(run_config: dict, ensemble_forecast: np.ndarray) -> list[str]:
+    """Orchestrator ``run_config.json`` sometimes omits ``maturities``; infer from arrays."""
+
+    mats = _maturity_columns(run_config)
+    if mats:
+        return mats
+    n_out = int(np.asarray(ensemble_forecast).shape[1])
+    defaults = list(_DEFAULT_YEARLY_MATURITIES)
+    if n_out == len(defaults):
+        logger.warning(
+            "run_config.json has no 'maturities'; using default yearly tenors %s "
+            "(%d outputs; same default as experiments/run_core_models.py).",
+            defaults,
+            n_out,
+        )
+        return defaults
+    labels = [str(i) for i in range(n_out)]
+    logger.warning(
+        "run_config.json has no 'maturities'; using placeholder labels %s (%d outputs). "
+        "Pass ShapRunConfig.maturities explicitly if order/names do not match training.",
+        labels,
+        n_out,
+    )
+    return labels
+
+
+def expanding_window_train_end(refit_t: int, gap: int) -> int:
+    """Exclusive end index for ``X.iloc[:end]`` — matches ``expanding_window`` at refit.
+
+    In ``window_utils.expanding_window``, each refit at row ``t`` uses
+    ``train_end = t - gap`` and fits on ``X.iloc[:train_end]`` (and ``y`` likewise).
+    That implements the usual **non-overlapping** annual horizon: with ``gap=11``
+    and monthly data, the last ``gap`` months before ``t`` are excluded so ``y`` at
+    training rows does not overlap the label being predicted at ``t``.
+
+    We clamp with ``max(..., 0)`` so ``iloc[:0]`` is an empty frame instead of a
+    negative slice (invalid / ambiguous in pandas) if ``refit_t < gap`` ever appears.
+    """
+
+    return max(int(refit_t) - int(gap), 0)
+
+
+def _preprocess_X_like_expanding_window_refit(
+    X_model: pd.DataFrame,
+    train_end: int,
+    *,
+    drop_unavailable_columns: bool = True,
+    carry_forward_latest: bool = True,
+) -> tuple[pd.DataFrame, pd.Index]:
+    """Match ``expanding_window`` refit: drop still-NaN-on-train columns, then ffill.
+
+    Local to Deep SHAP only — uses existing private helpers from
+    ``window_utils`` without changing that module's public surface.
+    """
+
+    if train_end <= 0:
+        raise ValueError(
+            "_preprocess_X_like_expanding_window_refit requires train_end > 0 "
+            f"(got {train_end})."
+        )
+    te = min(train_end, len(X_model))
+    X_work = X_model
+    if drop_unavailable_columns:
+        selected_columns = _select_train_available_columns(X_work.iloc[:te])
+        if len(selected_columns) == 0:
+            raise ValueError(
+                "Every column has NaN on the training slice "
+                f"rows [:train_end={train_end}); cannot align with expanding_window."
+            )
+        X_work = _apply_column_selection(X_work, selected_columns)
+    else:
+        selected_columns = X_work.columns
+    if carry_forward_latest:
+        X_work = _carry_forward_latest(X_work)
+    return X_work, selected_columns
 
 
 def _expected_value(explainer, fallback_model, background, device) -> np.ndarray:
@@ -207,10 +407,13 @@ def compute_shap_for_run(
     ----------
     cfg : ShapRunConfig
     X, dates :
-        Exactly the objects passed to ``run_experiment`` when the checkpoints
-        were produced. ``X`` must have the same columns and row index as then,
-        otherwise the saved scaler/PCA state will either dim-mismatch or produce
-        attributions on out-of-distribution inputs.
+        The same objects passed to ``expanding_window`` when the checkpoints were
+        saved. For **revised** macro runs, ``X`` is the shifted FRED MD panel; for
+        **realtime** runs, ``fred`` in ``X`` uses the same unshifted / placeholder
+        convention as training --- SHAP then replaces the ``fred`` block at each
+        OOS date via ``realtime=True`` (see ``cfg.realtime`` and
+        ``macro_variant`` auto-detection).
+
     y_all :
         Optional. Reserved for future sanity checks against realised excess
         returns; not currently read by the runner.
@@ -227,12 +430,29 @@ def compute_shap_for_run(
     with open(run_dir / "run_config.json") as fh:
         run_config = json.load(fh)
 
+    use_realtime = _effective_realtime_flag(cfg.realtime, run_config)
+    realtime_panel_cache: dict[pd.Timestamp, Any] = {}
+    rt_store: Any | None = None
+    if use_realtime:
+        from .forecast_vintages import ForecastVintageMacroStore
+
+        rt_store = cfg.realtime_store or ForecastVintageMacroStore()
+
     manifest = pd.read_csv(run_dir / "checkpoint_manifest.csv")
     manifest["date"] = pd.to_datetime(manifest["date"])
     manifest = manifest.sort_values(["seed", "t_index"]).reset_index(drop=True)
 
-    topk_indices = np.load(run_dir / "topk_indices.npy")  # (T, n_outputs, k)
-    ensemble_forecast = np.load(run_dir / "ensemble_forecast.npy")  # (T, n_outputs)
+    topk_path, ens_path, ensemble_metric_used = _resolve_ensemble_npy_paths(
+        run_dir, cfg.ensemble_metric
+    )
+    logger.info(
+        "Using ensemble arrays metric=%s topk=%s ensemble=%s",
+        ensemble_metric_used,
+        topk_path.name,
+        ens_path.name,
+    )
+    topk_indices = np.load(topk_path)  # (T, n_outputs, k)
+    ensemble_forecast = np.load(ens_path)  # (T, n_outputs)
 
     # Peek at one checkpoint to get wrapper_class
     sample_ckpt_path = Path(manifest.iloc[0]["checkpoint_path"])
@@ -248,7 +468,7 @@ def compute_shap_for_run(
     # ------------------------------------------------------------------ #
     # Resolve maturities / dates                                          #
     # ------------------------------------------------------------------ #
-    all_mats = _maturity_columns(run_config)
+    all_mats = _coerce_run_config_maturities(run_config, ensemble_forecast)
     mats = [str(m) for m in (cfg.maturities or all_mats)]
     missing = [m for m in mats if m not in all_mats]
     if missing:
@@ -271,7 +491,7 @@ def compute_shap_for_run(
     run_name = run_config.get("run_name", run_dir.parent.name)
     run_ts = run_dir.name
     out_root = Path(cfg.output_root).resolve()
-    out_dir = out_root / run_name / run_ts
+    out_dir = _shap_output_base_dir(out_root, run_name, run_ts, ensemble_metric_used)
     per_date_dir = out_dir / "per_date"
 
     if cfg.overwrite and out_dir.exists():
@@ -289,11 +509,18 @@ def compute_shap_for_run(
     logger.setLevel(logging.INFO)
 
     logger.info(
-        "Starting SHAP run: run_dir=%s, wrapper=%s, n_dates=%d, maturities=%s",
-        run_dir, wrapper_class, len(target_dates), mats,
+        "Starting SHAP run: run_dir=%s, output=%s, wrapper=%s, n_dates=%d, "
+        "maturities=%s, realtime=%s, ensemble_metric=%s",
+        run_dir,
+        out_dir,
+        wrapper_class,
+        len(target_dates),
+        mats,
+        use_realtime,
+        ensemble_metric_used,
     )
 
-    feature_names = adapter.feature_names(X, ckpt=sample_ckpt)
+    feature_names: list[str] | None = None
 
     # ------------------------------------------------------------------ #
     # Build lookups                                                       #
@@ -374,7 +601,18 @@ def compute_shap_for_run(
             continue
 
         t_index = int(date_to_t.loc[target_date])
-        X_row = X.iloc[[t_index]]
+        hist_start = pd.Timestamp(dates[0])
+        panel_eval_cached = None
+        if use_realtime:
+            fc_eval_d = pd.Timestamp(dates[t_index])
+            panel_eval_cached = realtime_panel_cache.get(fc_eval_d)
+            if panel_eval_cached is None:
+                panel_eval_cached = rt_store.panel_for_forecast_date(
+                    fc_eval_d, start=hist_start, end=fc_eval_d
+                )
+                realtime_panel_cache[fc_eval_d] = panel_eval_cached
+
+        cols_this_date: pd.Index | None = None
 
         per_mat_rows = []
         per_mat_base = []
@@ -406,10 +644,50 @@ def compute_shap_for_run(
 
                 model = adapter.rebuild_model(ckpt, run_config).to(cfg.device)
 
-                # Training window used at that refit (gap=0 in the runs we have).
                 gap = int(run_config.get("gap", 0))
-                train_end = max(refit_t - gap, 0)
-                X_train = X.iloc[:train_end]
+                train_end = expanding_window_train_end(refit_t, gap)
+
+                if use_realtime:
+                    fc_fit = pd.Timestamp(dates[refit_t])
+                    panel_fit = realtime_panel_cache.get(fc_fit)
+                    if panel_fit is None:
+                        panel_fit = rt_store.panel_for_forecast_date(
+                            fc_fit, start=hist_start, end=fc_fit
+                        )
+                        realtime_panel_cache[fc_fit] = panel_fit
+                    X_fit_trunc = _realtime_feature_frame(
+                        X, panel_fit.transformed, refit_t
+                    )
+                    X_fit_proc, cols = _preprocess_X_like_expanding_window_refit(
+                        X_fit_trunc, train_end
+                    )
+                    X_train = X_fit_proc.iloc[:train_end]
+
+                    assert panel_eval_cached is not None
+                    X_eval_trunc = _realtime_feature_frame(
+                        X, panel_eval_cached.transformed, t_index
+                    )
+                    X_eval_sel = _apply_column_selection(X_eval_trunc, cols)
+                    X_eval_proc = _carry_forward_latest(X_eval_sel)
+                    X_row = X_eval_proc.iloc[[t_index]]
+                else:
+                    X_proc, cols = _preprocess_X_like_expanding_window_refit(
+                        X, train_end
+                    )
+                    X_train = X_proc.iloc[:train_end]
+                    X_row = X_proc.iloc[[t_index]]
+
+                if cols_this_date is None:
+                    cols_this_date = cols
+                    tmpl = X.iloc[0:1].loc[:, cols_this_date]
+                    feature_names = adapter.feature_names(tmpl, ckpt=sample_ckpt)
+                elif not cols_this_date.equals(cols):
+                    raise ValueError(
+                        "SHAP column selection differs across top-k seeds on "
+                        f"{tag}; cannot merge attributions. "
+                        "(Often refit_freq>1 with misaligned checkpoints.)"
+                    )
+                assert feature_names is not None
 
                 background = adapter.sample_background(
                     X_train, ckpt, cfg.background_size, rng
@@ -575,8 +853,9 @@ def compute_shap_for_run(
         ).reset_index(drop=True)
         merged_seeds.to_parquet(out_dir / "per_seed_shap.parquet", index=False)
 
-    with open(out_dir / "feature_names.json", "w") as fh:
-        json.dump(feature_names, fh, indent=2)
+    if feature_names is not None:
+        with open(out_dir / "feature_names.json", "w") as fh:
+            json.dump(feature_names, fh, indent=2)
 
     meta = {
         "orchestrator_run_dir": str(run_dir),
@@ -596,6 +875,11 @@ def compute_shap_for_run(
         "check_additivity": cfg.check_additivity,
         "additivity_error_mean": float(np.mean(additivity_errors)) if additivity_errors else None,
         "additivity_error_max": float(np.max(additivity_errors)) if additivity_errors else None,
+        "macro_variant": run_config.get("macro_variant"),
+        "realtime_shap": use_realtime,
+        "ensemble_metric": ensemble_metric_used,
+        "orchestrator_topk_indices_path": str(topk_path),
+        "orchestrator_ensemble_forecast_path": str(ens_path),
         "config": asdict(_serialisable_cfg(cfg)),
         "created": datetime.now().isoformat(timespec="seconds"),
     }
@@ -624,7 +908,7 @@ def compute_shap_for_run(
         "elapsed_s": round(elapsed, 2),
         "additivity_error_mean": meta["additivity_error_mean"],
         "additivity_error_max": meta["additivity_error_max"],
-        "feature_names_head": feature_names[:5],
+        "feature_names_head": (feature_names[:5] if feature_names else []),
     }
 
 
@@ -635,12 +919,17 @@ def compute_shap_for_run(
 
 def _serialisable_cfg(cfg: ShapRunConfig) -> ShapRunConfig:
     """Return a copy of the config with Path objects stringified for JSON."""
+    d = asdict(cfg)
+    d["realtime_store"] = None
     return ShapRunConfig(
-        **{**asdict(cfg),
-           "orchestrator_run_dir": str(cfg.orchestrator_run_dir),
-           "output_root": str(cfg.output_root),
-           "dates": cfg.dates if isinstance(cfg.dates, (str, int, float))
-                   else [str(d) for d in cfg.dates]}
+        **{
+            **d,
+            "orchestrator_run_dir": str(cfg.orchestrator_run_dir),
+            "output_root": str(cfg.output_root),
+            "dates": cfg.dates
+            if isinstance(cfg.dates, (str, int, float))
+            else [str(x) for x in cfg.dates],
+        }
     )
 
 
