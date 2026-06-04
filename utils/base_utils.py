@@ -446,7 +446,7 @@ import seaborn as sns
 import pandas as pd
 import numpy as np
 
-def plot_cssed(y_true, y_forecast, dates, oos_start, secondary_start=None, model_name="Model"):
+def plot_cssed(y_true, y_forecast, dates, oos_start, secondary_start=None, model_name="Model", gap=11, recessions=None, ax=None, show_ylabel=True, show_legend=True):
     """
     Constructs a Welch-Goyal style CSSED plot.
     
@@ -462,7 +462,21 @@ def plot_cssed(y_true, y_forecast, dates, oos_start, secondary_start=None, model
         The date your OOS period actually begins.
     secondary_start : pd.Timestamp, optional
         The date for the right-hand zero-point (e.g., 2000-01-31).
+    gap : int, optional
+        The realization gap to lag the historical mean benchmark by (default: 11 for annual horizon).
+    recessions : pd.DataFrame, optional
+        Dataframe with a 'USREC' column for recession shading, indexed by date.
+    ax : matplotlib.axes.Axes, optional
+        The axis to plot on. If None, a new figure is created.
+    show_ylabel : bool, optional
+        If False, hides the y-labels but preserves their allocated space (useful for grids).
+    show_legend : bool, optional
+        If True, renders the legend indicating CSSED and recession shading.
     """
+    import matplotlib.dates as mdates
+    import matplotlib.patches as mpatches
+    from matplotlib.lines import Line2D
+
     # 1. Align data and filter for OOS period
     df = pd.DataFrame({
         'realized': y_true,
@@ -472,9 +486,9 @@ def plot_cssed(y_true, y_forecast, dates, oos_start, secondary_start=None, model
     oos_df = df.loc[oos_start:].copy()
     
     # 2. Generate Historical Mean Benchmark (Expanding Window)
-    # We use the same logic as the paper: mean of all returns available up to t-1
+    # We use the same logic as the paper: mean of all returns available up to t-(gap+1)
     full_series = pd.Series(y_true, index=dates)
-    oos_df['hist_mean_bench'] = [full_series.loc[:d].iloc[:-1].mean() for d in oos_df.index]
+    oos_df['hist_mean_bench'] = [full_series.loc[:d].iloc[:-(gap + 1)].mean() for d in oos_df.index]
     
     # 3. Calculate Squared Errors
     oos_df['error_model'] = (oos_df['realized'] - oos_df['forecast'])**2
@@ -485,39 +499,69 @@ def plot_cssed(y_true, y_forecast, dates, oos_start, secondary_start=None, model
     oos_df['cssed'] = (oos_df['error_bench'] - oos_df['error_model']).cumsum()
     
     # 5. Plotting
-    sns.set_style("whitegrid")
-    fig, ax1 = plt.subplots(figsize=(12, 6))
+    show_plot = False
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(12, 6), dpi=300)
+        show_plot = True
     
-    # Primary Line (Solid black/blue is standard for OOS)
-    sns.lineplot(data=oos_df, x=oos_df.index, y='cssed', ax=ax1, color='black', linewidth=2)
+    ax.plot(oos_df.index, oos_df['cssed'], color='black', linewidth=2, label='CSSED')
+    ax.axhline(0, color='red', linestyle='--', alpha=0.6)
     
-    ax1.axhline(0, color='red', linestyle='--', alpha=0.6) # The "Null" Benchmark line
-    ax1.set_ylabel(f'Cumulative SSE Difference (Zero at {oos_start.year})', fontsize=12)
-    ax1.set_xlabel('Year', fontsize=12)
-    ax1.set_title(f'OOS Performance: {model_name} vs. Historical Mean', fontsize=14)
+    # Add recession shading
+    if recessions is not None:
+        oos_rec = recessions.reindex(oos_df.index, method='ffill').fillna(0)
+        if 'USREC' in oos_rec.columns:
+            ax.fill_between(oos_df.index, 0, 1, where=(oos_rec['USREC'] == 1), 
+                            color='gray', alpha=0.2, transform=ax.get_xaxis_transform(), label='NBER Recession')
+
+    ax.set_ylabel(f'CSSED (Zero at {oos_start.year})', fontsize=12)
+    if not show_ylabel: # Hide text but keep space for consistent plot widths
+        ax.yaxis.label.set_color('none')
+
+    ax.set_xlabel('Date', fontsize=12)
+    ax.set_title(f'{model_name}', fontsize=14)
+    ax.grid(alpha=0.3)
+
+    # Set x-axis ticks to multiples of 5 years
+    ax.xaxis.set_major_locator(mdates.YearLocator(base=5))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
 
     # 6. Secondary Axis (The Welch-Goyal Vertical Shift)
     if secondary_start and secondary_start in oos_df.index:
         val_at_secondary = oos_df.loc[secondary_start, 'cssed']
         
-        # We create a twin axis
-        ax2 = ax1.twinx()
+        ax2 = ax.twinx()
         
-        # To make the right axis 0 at the secondary_start, we align the limits
-        # by shifting the primary limits by the value at the secondary start
-        y1_min, y1_max = ax1.get_ylim()
+        # Use matplotlib's autoscale to ensure main axis is sized properly first
+        ax.autoscale(enable=True, axis='y')
+        y1_min, y1_max = ax.get_ylim()
+        
         ax2.set_ylim(y1_min - val_at_secondary, y1_max - val_at_secondary)
         
         ax2.set_ylabel(f'CSSED (Zero at {secondary_start.year})', fontsize=12)
-        ax2.axhline(0, color='gray', linestyle=':', alpha=0.5) # Zero line for the right axis
-        
-        # Mark the secondary zero point on the x-axis
-        ax1.axvline(secondary_start, color='blue', linestyle='--', alpha=0.3)
-        ax1.text(secondary_start, y1_max, f' Start {secondary_start.year}', 
-                 verticalalignment='top', color='blue', fontsize=10)
+        if not show_ylabel: # Hide text but keep space for consistent plot widths
+            ax2.yaxis.label.set_color('none')
+            ax2.set_yticklabels([label.get_text() for label in ax2.get_yticklabels()], color='none')
+            ax2.tick_params(axis='y', colors='none')
 
-    plt.tight_layout()
-    plt.show()
+        ax2.axhline(0, color='gray', linestyle=':', alpha=0.5) 
+        ax.axvline(secondary_start, color='blue', linestyle='--', alpha=0.3)
+    
+    if show_plot:
+        if show_legend:
+            # Custom legend
+            custom_lines = [
+                Line2D([0], [0], color='black', lw=2),
+                mpatches.Patch(color='gray', alpha=0.2)
+            ]
+            labels = ['CSSED', 'NBER Recession'] if recessions is not None and 'USREC' in recessions.columns else ['CSSED']
+            lines = custom_lines if recessions is not None and 'USREC' in recessions.columns else [custom_lines[0]]
+            # ax.legend(lines, labels, loc='best', prop={'size': 10})
+        
+        plt.tight_layout()
+        plt.show()
+    
+    return ax
 
 def RSZ_Signif(y_true, y_forecast, gap=0):
     # Copied from the replication code of Bianchi et al. (2021), adapted so

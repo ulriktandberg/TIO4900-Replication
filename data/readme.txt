@@ -10,6 +10,10 @@ gsw_yields.csv|https://www.federalreserve.gov/data/nominal-yield-curve.htm|02.11
 
 kr_yields.csv|https://www.discount-bond-data.org/|02.09.2026
 
-lw_yields.csv|https://sites.google.com/view/jingcynthiawu/yield-data|unknown
+lw_yields.csv|https://sites.google.com/view/jingcynthiawu/yield-data|01.06.2026
+    This dataset is used for the dataset robustness check 
+
+lw_yields_old.csv|https://sites.google.com/view/jingcynthiawu/yield-data|unknown
+    This dataset is used for the overlapping return/BBT replication in the main text. 
 
 USREC.csv|https://fred.stlouisfed.org/series/USREC#|05.13.2026
