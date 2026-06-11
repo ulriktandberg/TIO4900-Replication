@@ -556,7 +556,7 @@ def plot_cssed(y_true, y_forecast, dates, oos_start, secondary_start=None, model
             ]
             labels = ['CSSED', 'NBER Recession'] if recessions is not None and 'USREC' in recessions.columns else ['CSSED']
             lines = custom_lines if recessions is not None and 'USREC' in recessions.columns else [custom_lines[0]]
-            # ax.legend(lines, labels, loc='best', prop={'size': 10})
+            ax.legend(lines, labels, loc='best', prop={'size': 10})
         
         plt.tight_layout()
         plt.show()

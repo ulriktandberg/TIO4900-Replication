@@ -16,3 +16,4 @@ __pycache__/
 # model artifacts
 notebooks/artifacts/
 artifacts/
+deprecated/bianchi_replication
