@@ -1,29 +1,85 @@
-# TIØ4900 Master's Thesis: Bond Return Forecasting Replication
+# TIØ4900 Replication Repository
 
-Minimal replication codebase for the master's thesis, focusing on forecasting bond excess returns using expanding-window OOS frameworks.
+This repository contains the replication code for our TIØ4900 master's thesis on machine learning evidence in U.S. bond excess return forecasting: Machine Learning Evidence on Bond Risk Premia and the Spanning Hypothesis.
 
-## Purpose
-This repository provides utilities, models, and Jupyter notebooks to reproduce out-of-sample expanding-window forecasting experiments ($y_{t+1} = \beta x_t$) for bond excess returns using yields (e.g., KR yields) and macroeconomic factors (e.g., FRED-MD). The project explicitly implements deep learning ensembles and standard baseline models found in macro-finance literature (e.g., Ludvigson and Ng).
+The codebase is organized around Jupyter notebooks and supporting Python modules for constructing predictors, running expanding-window forecasts, evaluating models, and producing the tables and figures used in the thesis.
 
-## Quick Start
-1. Ensure your required data files are placed within the `data/` directory (e.g., `2026-01-MD.csv`, `kr_yields.csv`, `gsw_yields.csv`).
-2. Install the necessary dependencies (consider creating a virtual environment and using `pip install -r requirements.txt`).
-3. Open and run `notebooks/init.ipynb` via your preferred Jupyter environment (e.g., VS Code, JupyterLab) as an entry point for data generation, expanding windows, and results visualization.
+## Main entry point
 
-## Directory Structure
-- **`bianchi_replication/`** — Original code templates and NN ensembling prototypes replicated from macroeconomic bond forecasting research.
-- **`data/`** — Subdirectory for raw and generated datasets. Ensure ALFRED / FRED-MD snapshots and yield curves (KR, GSW, LW) are stored here.
-- **`models/`** — Source code for the actual model wrappers.
-  - Classical (Random Walk, Historical Mean, Cochrane-Piazzesi)
-  - Linear (PCA, Ridge, PCR)
-  - Tree-based (Random Forest, Extra Trees)
-  - Deep Learning (`pytorch_mlp.py`, `ann.py`, etc., including PyTorch-based ensemble models with automated early stopping)
-- **`notebooks/`** — Jupyter Notebooks for exploratory data analysis (`eda.ipynb`), individual models (`gbt.ipynb`, `lasso_pcr.ipynb`), and the main testing environment (`init.ipynb`).
-- **`utils/`** — Core helpers:
-  - `base_utils.py` — Data loaders, returns calculus, forward rate generation, plotting functions.
-  - `window_utils.py` — Expanding-window OOS execution framework and $R^2_{OOS}$ eval metrics.
-  - `macro_grouping.py` / `shap_utils.py` — Data structuring and explainability components.
+The main playground and entry point is:
 
-## Notes & Best Practices
-- **Data Leakage:** All standardization, scaling, dimensionality reduction (e.g., PCA) or hyperparameter grids are optimized strictly within the `fit()` steps on the respective in-sample partition to ensure no forward-looking bias. 
-- **Ensemble Stability:** The built-in MLP/Neural Network wrappers support `n_mc` (Monte Carlo runs) and `n_avg` (top-N validation selection), making it straightforward to match complex ensembling rules while maintaining reproducibility via seeds.
+```text
+notebooks/init.ipynb
+```
+
+Start there to inspect the data pipeline, construct yield and macro predictors, generate excess returns, and run smaller exploratory workflows.
+
+## Main result generation
+
+The main forecasting results are produced from the orchestrator notebooks in:
+
+```text
+notebooks/orchestrators/
+```
+
+The most important orchestrators are:
+
+```text
+notebooks/orchestrators/orchestrator_ann_runs.ipynb
+notebooks/orchestrators/orchestrator_linear_runs.ipynb
+notebooks/orchestrators/orchestrator_tree_runs.ipynb
+```
+
+These notebooks run the main model families used in the thesis:
+
+- ANN models and ensembles are generated from the ANN orchestrator notebooks.
+- Linear model results are generated from the linear orchestrator notebooks.
+- Tree-based model results are generated from the tree orchestrator notebooks.
+
+The ANN tables reported in the text are obtained from the `CSSED_ANN` and `monthly_results` notebooks. The linear and tree model tables are obtained directly from the corresponding orchestrator notebooks.
+
+## Repository structure
+
+```text
+data/
+models/
+notebooks/
+utils/
+```
+
+### `data/`
+
+Contains the CSV files used by the replication code. For the data provenance, see:
+
+```text
+data/readme.txt
+```
+
+No additional data-source documentation is provided here; the `data/readme.txt` file is the authoritative reference for the included datasets.
+
+### `models/`
+
+Contains model implementations and model configuration code used by the forecasting notebooks. This includes wrappers and configurations for linear models, tree-based models, and artificial neural networks.
+
+### `notebooks/`
+
+Contains the main analysis notebooks. The most important notebook for getting started is `init.ipynb`, while the main forecasting runs are handled by the notebooks under `notebooks/orchestrators/`.
+
+Additional notebooks are used for result aggregation, monthly results, CSSED figures, and other thesis-specific reporting workflows.
+
+### `utils/`
+
+Contains shared helper code for data loading, return construction, forward-rate construction, expanding-window forecasting, result persistence, plotting, model orchestration, macro grouping, and SHAP-related analysis.
+
+## Typical workflow
+
+1. Check that the required CSV files are present in `data/`.
+2. Open `notebooks/init.ipynb` to inspect the main data and forecasting setup.
+3. Run the relevant orchestrator notebook under `notebooks/orchestrators/`.
+4. Use the result and visualization notebooks to reproduce the reported tables and figures.
+
+## Data disclaimer
+
+The included data CSV files are not owned by us. They are included only to make the replication workflow easier to run. If any rights holder or data provider requests that a dataset be removed, it will be taken down.
+
+This README was written by ChatGPT. 
